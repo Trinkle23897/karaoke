@@ -340,8 +340,11 @@ class VideoSearch:
         key = provider, query, cursor
         cached = self.cache.get(key)
         if cached and time.monotonic()-cached[0] < 120:
-            self.cache.move_to_end(key)
-            return cached[1]
+            # The page may outlive its next-page handle in the independent cursor LRU.
+            next_cursor = cached[1].get('next_cursor')
+            if next_cursor is None or next_cursor in self.cursors:
+                self.cache.move_to_end(key)
+                return cached[1]
         if key not in self.pending:
             if len(self.pending) >= 8:
                 raise OverflowError('Too many pending searches')

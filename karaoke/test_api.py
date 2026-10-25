@@ -12380,6 +12380,56 @@ def test_search_pages_bind_cursors_deduplicate_retries_and_reject_expiry(tmp_pat
         assert len(calls) == 9  # first page, failed continuation, successful retry for each mode
 
 
+@pytest.mark.parametrize('provider', ['youtube', 'songs', 'artist'])
+@pytest.mark.parametrize('later_page', [False, True])
+def test_search_refreshes_cached_pages_after_next_cursor_eviction(monkeypatch, provider, later_page):
+    import asyncio
+
+    from karaoke import video_search
+
+    async def scenario():
+        service = video_search.VideoSearch()
+        calls = []
+
+        async def fetch(provider, query, continuation=None):
+            calls.append((provider, query, continuation))
+            await asyncio.sleep(0)
+            page = (continuation or {}).get('page', 1)
+            return dict(results=[dict(title=f'{query} page {page}')],
+                        continuation=dict(page=page+1) if page < 3 else None)
+
+        monkeypatch.setattr(video_search, 'fetch_results', fetch)
+        first = await service.search(provider, 'Singer')
+        request_cursor = first['next_cursor'] if later_page else None
+        cached = await service.search(provider, 'Singer', request_cursor)
+        next_cursor = cached['next_cursor']
+        # Keep this page hot while other searches fill the independent cursor LRU.
+        for index in range(256):
+            assert await service.search(provider, 'Singer', request_cursor) == cached
+            await service.search(provider, f'Other {index}')
+            if next_cursor not in service.cursors:
+                break
+        assert next_cursor not in service.cursors
+        assert (provider, 'Singer', request_cursor) in service.cache
+        with pytest.raises(video_search.SearchCursorExpired):
+            await service.search(provider, 'Singer', next_cursor)
+        # Retrying the page must recover, and simultaneous retries share one fetch.
+        refreshed, duplicate = await asyncio.gather(
+            service.search(provider, 'Singer', request_cursor),
+            service.search(provider, 'Singer', request_cursor))
+        assert refreshed == duplicate
+        assert refreshed['results'] == cached['results']
+        assert refreshed['next_cursor'] != next_cursor
+        assert len([call for call in calls if call[1] == 'Singer']) == 2+int(later_page)
+        following = await service.search(provider, 'Singer', refreshed['next_cursor'])
+        page = 3 if later_page else 2
+        assert following['results'] == [dict(title=f'Singer page {page}', rank=page)]
+        assert len(service.cursors) <= 256 and len(service.cache) <= 32
+        await service.close()
+
+    asyncio.run(scenario())
+
+
 def test_playback_survey_classifies_empty_subtitles_without_rewriting_recorded_attempts():
     from karaoke.tools.playback_sweep import summarize
     event = dict(code='align_words_failed', subtitle_mode='unavailable')

@@ -166,13 +166,18 @@ export class LocalPlayback {
       levels:{instrumental:1, backing_vocals:1, lead_vocals:bounded(saved?.levels?.lead_vocals, 0, 1, 0)},
       pitch_semitones:Math.round(bounded(saved?.pitch_semitones, -6, 6, 0))};
     this.playedAt = saved?.played_at || null;
+    this.skipped = new Set(saved?.skipped_ids || []);
     this.leadRestore = this.state.levels.lead_vocals || bounded(saved?.lead_restore, 0, 1, 1) || 1;
-    this.pendingFinishes = saved?.pending_finishes || (saved?.finished_ids || []).map(entry_id =>
-      ({entry_id, playback_started_at:null}));
+    // Older unsung operations did not distinguish skipping a waiting song from
+    // removing it. Never replay an ambiguous deletion after an upgrade.
+    this.pendingFinishes = (saved?.pending_finishes || []).filter(item => item.action || item.playback_started_at != null)
+      .map(item => ({action:'finish', ...item}));
   }
 
   reconcile(room) {
-    const first = room.entries.find(entry => !this.isFinished(entry.id)) || null;
+    if (this.skipped.size) this.skipped = new Set(room.entries.filter(e => this.skipped.has(e.id)).map(e => e.id));
+    const available = entry => !this.skipped.has(entry.id) && !this.isFinished(entry.id);
+    const first = room.entries.find(available) || null;
     // An idle preselection follows the queue. Pause, buffering and a saved seek
     // position do not end an existing performance.
     const idle = !this.state.playing && this.playedAt === null && this.state.position === 0;
@@ -186,7 +191,7 @@ export class LocalPlayback {
       else if (updated) this.entry = {...updated, id:this.entry.id};
     }
     if (this.state.playing && this.entry?.status !== 'completed') {
-      const ready = room.entries.find(entry => entry.status === 'completed' && !this.isFinished(entry.id));
+      const ready = room.entries.find(entry => entry.status === 'completed' && available(entry));
       if (ready) this.select(ready, true);
     }
     return {...room, ...this.state, current_id:this.entry?.id || null};
@@ -219,7 +224,7 @@ export class LocalPlayback {
     this.flushing = (async () => {
       while (this.pendingFinishes.length && owns()) {
         const finished = this.pendingFinishes[0];
-        const updated = await send({action:'finish', ...finished});
+        const updated = await send(finished);
         if (!owns()) return;
         this.pendingFinishes = this.pendingFinishes.filter(item => item !== finished);
         accept(updated);
@@ -234,8 +239,10 @@ export class LocalPlayback {
     this.markPlayed();
     let finished;
     if (['next','remove'].includes(action)) {
-      const target = entries.find(entry => entry.id !== this.entry?.id && !this.isFinished(entry.id));
-      if (this.entry) finished = {entry_id:this.entry.id,
+      if (action === 'next' && this.entry && this.entry.status !== 'completed') this.skipped.add(this.entry.id);
+      const target = entries.find(entry => entry.id !== this.entry?.id && !this.skipped.has(entry.id) && !this.isFinished(entry.id));
+      if (this.entry && (action === 'remove' || this.entry.status === 'completed'))
+        finished = {action:action === 'remove' ? 'remove' : 'finish', entry_id:this.entry.id,
         playback_started_at:this.playedAt === null ? null : this.playedAt + clockOffset};
       if (finished) this.pendingFinishes.push(finished);
       this.select(target || null, action === 'remove' ? state.playing : true);
@@ -245,12 +252,16 @@ export class LocalPlayback {
       if (state.levels.lead_vocals > 0) this.leadRestore = state.levels.lead_vocals;
     } else if (action === 'pitch') {
       state.pitch_semitones = extra.pitch_semitones;
-    } else if (action === 'play') state.playing = true;
+    } else if (action === 'play') {
+      if (!this.entry) this.skipped.clear();
+      state.playing = true;
+    }
     else if (action === 'pause') Object.assign(state, {position:this.position(), playing:false, started_at:null});
     else if (this.entry) {
       if (action === 'restart') Object.assign(state, {position:0, started_at:null, pitch_semitones:0});
       else if (action === 'seek') Object.assign(state, {position:bounded(extra.position, 0, Math.max(0, (this.entry.duration || 0)-.05), 0), started_at:null});
       else if (action === 'ready' && state.playing && state.started_at === null && this.entry.status === 'completed') {
+        this.skipped.clear(); // After the next song starts, skipped entries can be selected again.
         const delay = state.position === 0 ? Math.max(0, -(this.entry.opening_countdown?.start || 0)) : 0;
         state.started_at = Date.now()/1000 + delay;
       } else if (action === 'buffering' && state.playing && state.started_at !== null && extra.playback_started_at === state.started_at) {
@@ -264,6 +275,6 @@ export class LocalPlayback {
     this.markPlayed();
     return {entry:this.entry, playing:this.state.playing, position:Math.max(0, position), levels:this.state.levels,
       pitch_semitones:this.state.pitch_semitones, lead_restore:this.leadRestore,
-      played_at:this.playedAt, pending_finishes:this.pendingFinishes};
+      played_at:this.playedAt, pending_finishes:this.pendingFinishes, skipped_ids:[...this.skipped]};
   }
 }

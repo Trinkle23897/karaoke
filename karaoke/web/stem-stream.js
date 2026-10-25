@@ -60,14 +60,15 @@ async function readMedia(url, signal, consume) {
 }
 
 export class StemStream {
-  constructor(context, url, signal, changed, cached) {
-    Object.assign(this, {context, url, signal, changed});
+  constructor(context, url, signal, changed, cached, version) {
+    Object.assign(this, {context, url, signal, changed, version});
     this.windows = new Map([...cached?.windows || []].filter(([, item]) => item.audio)
       .map(([index, {audio}]) => [index, {audio, loading:Promise.resolve(audio)}]));
     this.encoded = new Map(cached?.encoded);
     this.loading = (cached?.info ? Promise.resolve(cached.info) :
       this.read(url, signal, response => response.json())).then(info => {
       this.info = info;
+      this.version ??= info.version;
       this.stems = info.stems || ['instrumental', 'backing_vocals', 'lead_vocals'];
       this.duration = info.frames / info.sample_rate;
       this.count = Math.ceil(info.frames / info.chunk_frames);
@@ -75,7 +76,9 @@ export class StemStream {
   }
 
   read(url, signal, consume) {
-    return readMedia(`${url}?sample_rate=${this.context.sampleRate}`, signal, consume);
+    const query = new URLSearchParams({sample_rate:this.context.sampleRate});
+    if (this.version) query.set('v', this.version);
+    return readMedia(`${url}?${query}`, signal, consume);
   }
 
   index(position) {

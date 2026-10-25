@@ -363,6 +363,7 @@ export class Player {
 
   matches(entry) {
     return Boolean(entry && this.key === entry.id && this.entry?.job_id === entry.job_id &&
+      this.entry.playback_version === entry.playback_version &&
       ['mv', 'accompaniment', 'instrumental', 'backing_vocals', 'lead_vocals'].every(
         name => this.entry.artifacts[name] === entry.artifacts[name]));
   }
@@ -420,7 +421,7 @@ export class Player {
     this.video.src = entry.artifacts.mv;
     this.video.load();
     this.loadIntro(entry, signal);
-    this.stream = new StemStream(this.context, `/v1/jobs/${entry.job_id}/playback`, signal, () => this.pump(), cached);
+    this.stream = new StemStream(this.context, `/v1/jobs/${entry.job_id}/playback`, signal, () => this.pump(), cached, entry.playback_version);
     this.loading = Promise.all([this.stream.prepare(position), videoReady(this.video, signal, position)]).then(() => {
       if (signal.aborted) return;
       this.ready = true;

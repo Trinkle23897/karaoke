@@ -233,6 +233,23 @@ test('removing the current song preserves pause or continuous-play intent', () =
   }
 });
 
+test('skipping a waiting entry stays local after reload; an explicit removal is replayed as remove', async () => {
+  const entries=['one','two'].map(id=>({id,job_id:id,status:'queued'}));
+  let local=new LocalPlayback(); local.reconcile({entries});
+  local.command('next',{entry_id:'one'},entries);
+  local=new LocalPlayback(local.save());
+  entries[0].status='completed';
+  local.reconcile({entries});
+  assert.equal(local.entry.id,'two');
+  await local.flushFinishes(()=>assert.fail('a local skip must not delete a queue entry'),()=>{});
+  local.command('remove',{entry_id:'two'},entries);
+  local=new LocalPlayback(local.save()); const sent=[];
+  await local.flushFinishes(async command=>{sent.push(command);return {entries:[entries[0]]};},room=>local.reconcile(room));
+  assert.deepEqual(sent,[{action:'remove',entry_id:'two',playback_started_at:null}]);
+  local.command('play',{},[entries[0]]); local.reconcile({entries:[entries[0]]});
+  assert.equal(local.entry.id,'one');
+});
+
 let frame;
 class Context extends EventTarget {
   sampleRate = 48000;
@@ -379,7 +396,7 @@ test('finishing on one device does not interrupt the other or resurrect a remove
   }
   now+=5;
   const {finished}=phone.command('next',{entry_id:'one'},room.entries);
-  assert.deepEqual(finished,{entry_id:'one',playback_started_at:100});
+  assert.deepEqual(finished,{action:'finish',entry_id:'one',playback_started_at:100});
   room.entries.shift();
   computer.reconcile(room); phone.reconcile(room);
   assert.equal(computer.entry.id,'one'); assert.equal(computer.position(),5);
@@ -1143,6 +1160,21 @@ test('a repaired asset reloads the same song; metadata updates keep the current 
       assert.equal(p.video.currentTime,3); assert.equal(p.video.paused,true);
       await p.apply(state,clockOffset());
       assert.deepEqual(p.gains.map(g=>g.gain.value),[1,1,0]);
+    }
+  } finally { p.clear(); }
+});
+
+test('manifest and every stem window load the room version, including after a gain-only update', async t => {
+  const urls=[];
+  t.mock.method(globalThis,'fetch',async url=>{urls.push(new URL(url,'http://localhost'));return fetchAudio(url);});
+  const p=setup(); await p.unlock();
+  try {
+    for (const version of ['first','new-gain']) {
+      urls.length=0;
+      await p.load({...song,playback_version:version});
+      const requested=urls.filter(url=>url.pathname.includes('/playback'));
+      assert.equal(requested.length,4);
+      assert.ok(requested.every(url=>url.searchParams.get('v')===version && url.searchParams.get('sample_rate')==='48000'));
     }
   } finally { p.clear(); }
 });

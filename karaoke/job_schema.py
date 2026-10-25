@@ -1,5 +1,6 @@
 """Public job inputs, safe provider errors and single-video platform URLs."""
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,18 @@ def playback_stems(artifacts):
     """Published playback layouts; old three-track songs remain playable."""
     return (('accompaniment', 'lead_vocals') if 'accompaniment' in artifacts else
             ('instrumental', 'backing_vocals', 'lead_vocals'))
+
+
+def playback_version(result):
+    artifacts = result.get('artifacts', {})
+    stems = [(name, artifacts.get(name, {}).get('sha256')) for name in playback_stems(artifacts)]
+    if result.get('shared_preview_gain') is None or not all(digest for _, digest in stems):
+        return None
+    return hashlib.sha256(json.dumps([stems, result['shared_preview_gain']]).encode()).hexdigest()
+
+
+def preparation_rank(job_ids):
+    return {job_id: rank for rank, job_id in enumerate(dict.fromkeys(job_ids))}
 
 
 def download_backoff(url, directory=None, *, until=0):

@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from .cache import can_restore_video
-from .job_schema import JobRequest, download_backoff, thumbnail_url
+from .job_schema import JobRequest, download_backoff, playback_version, thumbnail_url
 
 PRESETS = {
     'instrumental': dict(instrumental=1., backing_vocals=0., lead_vocals=0.),
@@ -227,7 +227,7 @@ class Room:
                 'lyrics_provenance', {}).get('needs_review', False),
             lyrics_unavailable=result.get('quality', {}).get('playback_fallback', {}).get('subtitle_mode') == 'unavailable',
             opening_countdown=result.get('quality', {}).get('opening_countdown'),
-            artifacts=artifacts)
+            artifacts=artifacts, playback_version=playback_version(result))
 
     def snapshot(self):
         state = self.read()
@@ -310,7 +310,8 @@ class Room:
                 songs.append(song)
                 by_url[url] = song
             song.update({key: info[key] for key in ('title', 'artist', 'url', 'language', 'duration',
-                'poster', 'status', 'active_stages', 'stage_progress', 'preparation_started_at', 'next_retry_at', 'error', 'artifacts')})
+                'poster', 'status', 'active_stages', 'stage_progress', 'preparation_started_at', 'next_retry_at', 'error',
+                'artifacts', 'playback_version')})
             song['job_id'] = job['id'] if ready or job.get('restore_video') or job['status'] in ('queued', 'running') else None
             if job['status'] == 'completed' and not ready:
                 song.update(status='evicted', poster=None)
@@ -383,8 +384,8 @@ class Room:
         current = next((e for e in state['entries'] if e['id'] == state['current_id']), None)
         entry = next((e for e in state['entries'] if e['id'] == command.entry_id), None)
         action = command.action
-        if action == 'finish' and entry is None:
-            return self.snapshot()  # Another browser already finished this entry.
+        if entry is None and (action == 'finish' or action == 'remove' and command.entry_id):
+            return self.snapshot()  # A retried command or another browser already removed it.
         if action == 'finish' and self.describe(entry)['status'] != 'completed':
             return self.snapshot()  # Skipping an unprepared song must not delete it.
         if action in ('pause', 'seek', 'ready', 'buffering', 'next') and command.entry_id != state['current_id']:
@@ -436,10 +437,9 @@ class Room:
                          started_at=None, playing=bool(entry))
         elif action in ('remove', 'finish'):
             assert entry is not None  # Missing entries were handled above.
-            if action == 'finish' and command.playback_started_at is not None:
+            if command.playback_started_at is not None:
                 entry['played_at'] = min(time.time(), command.playback_started_at)
-            if entry == current or action == 'finish':
-                self.remember_song(state, entry)
+            self.remember_song(state, entry)
             state['entries'].remove(entry)
             if entry == current:
                 following = state['entries'][0] if state['entries'] else None
@@ -488,6 +488,8 @@ class Room:
                 job = self.store.update(old['id'], error=None,
                     download_retry={**old['download_retry'], 'next_retry_at': None, 'count': 0})
                 cached = False
+            elif action == 'retry':
+                job, cached = self.store.retry(old['id'], self.version), False
             else:
                 job, cached = self.store.create(payload, self.version)
             if action == 'reprepare':

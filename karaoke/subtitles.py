@@ -282,6 +282,7 @@ def countdown_events(cues, minimum_silence=4., dots=3, step_seconds=1., settle_s
         raise ValueError('Countdown must fit inside the minimum vocal gap')
     events = []
     previous_end = 0.
+    last_end_known = True
     for line, cue in enumerate(cues):
         units = cue.get('units') or [{'start': cue.get('aligned_start', cue['start']),
                                      'end': cue.get('aligned_end', cue['end'])}]
@@ -290,11 +291,13 @@ def countdown_events(cues, minimum_silence=4., dots=3, step_seconds=1., settle_s
             if not (math.isfinite(onset) and onset >= 0 and (end is None or
                     math.isfinite(end) and onset < end)):
                 raise ValueError('Countdown requires valid acoustic intervals')
-            if (line == 0 and index == 0) or previous_end is not None and onset-previous_end >= minimum_silence:
+            if (line == 0 and index == 0) or last_end_known and onset-previous_end >= minimum_silence:
                 events.append(dict(line=line, unit=index, start=onset-duration,
                                    onset=onset, previous_end=previous_end,
                                    dots=dots, step_seconds=step_seconds, settle_seconds=settle_seconds))
-            previous_end = None if end is None else max(previous_end or 0., end)
+            last_end_known = end is not None
+            if end is not None:
+                previous_end = max(previous_end, end)
     return events
 
 

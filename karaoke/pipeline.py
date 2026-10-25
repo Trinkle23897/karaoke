@@ -27,7 +27,14 @@ if str(ROOT) not in sys.path:
 
 from . import local_asr
 from .cache import can_restore_video
-from .job_schema import JobRequest, download_backoff, provider_error, retry_fields, song_language
+from .job_schema import (
+    JobRequest,
+    download_backoff,
+    preparation_rank,
+    provider_error,
+    retry_fields,
+    song_language,
+)
 from .song_sources import (
     independent_transcript_support,
     lyric_coverage,
@@ -450,7 +457,7 @@ class Pipeline:
                             order = json.loads((folder/'priority.json').read_text())
                         except (OSError, ValueError):
                             order = []
-                        rank = {job: index for index, job in reversed(list(enumerate(order)))}
+                        rank = preparation_rank(order)
                         candidates = []
                         for path in folder.glob(lane+'.*.json'):
                             try:
@@ -1689,24 +1696,27 @@ class Pipeline:
     def render_video(self, result, picture=None):
         paths = {name: self.output/a['path'] for name, a in result['artifacts'].items()}
         readings = self.reading_inputs(result, paths['subtitles'])
+        presentation = paths['mv'].with_suffix('.presentation.json')
         result.pop('video_only', None)
         result['video_audio'] = 'silent_aac'
         with self.checkpoints.stage('render',
                 inputs=[self.video, paths['subtitles'], *readings],
-                outputs=[paths['mv']],
+                outputs=[paths['mv'], presentation],
                 config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
-                    'implementation': inspect.getsource(type(self).render_uncached)},
+                    'implementation': [inspect.getsource(type(self).render_video),
+                                       inspect.getsource(type(self).render_uncached)]},
                 code=[ROOT/p for p in ('playback_video.py', 'render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py', 'lyric_progress.py',
                                       'subtitle_style.py', 'subtitle-styles.json', 'lyric_readings.py')]) as reused:
             if not reused:
                 self.render_uncached(result, picture)
+                rendered = picture if picture is not None else self.output/'captioned-picture.mp4'
+                report = json.loads(rendered.with_suffix('.render.json').read_text())
+                write_json(presentation, dict(countdown_events=report['countdown']['events'],
+                                              opening_countdown=report['opening_countdown']))
+        result.setdefault('quality', {}).update(json.loads(presentation.read_text()))
 
     def render_uncached(self, result, picture=None):
         picture = picture if picture is not None else self.render_picture(result)
-        presentation = json.loads(picture.with_suffix('.render.json').read_text())
-        result.setdefault('quality', {}).update(
-            countdown_events=presentation['countdown']['events'],
-            opening_countdown=presentation['opening_countdown'])
         paths = {name: self.output/a['path'] for name, a in result['artifacts'].items()}
         self.run('mux_video', [sys.executable, ROOT/'playback_video.py', picture, paths['mv']])
         self.run('verify_video', ['ffmpeg', '-v', 'error', '-xerror', '-nostdin', '-i', paths['mv'], '-f', 'null', '-'])
@@ -1722,7 +1732,7 @@ class Pipeline:
         from .exact_stems import decode_source, pcm_sha
         started = time.perf_counter()
         result = json.loads((self.output/'result.json').read_text())
-        if not can_restore_video(self.output, result):
+        if not can_restore_video(self.output, result, verify_hash=True):
             raise StageFailure('restore_video', '保留的音轨或字幕不完整，无法补回视频')
         self.download(artwork=False, format_id=result.get('source_format'))
         self.phase('verify_video', True)

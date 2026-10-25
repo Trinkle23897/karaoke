@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from functools import cache
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
@@ -46,18 +47,32 @@ def structured_lyrics_source(monkeypatch):
     return fetch
 
 
-def fake_worker(folder):
-    code = '''import hashlib,json,pathlib,sys,time
+@cache
+def fixture_video():
+    return subprocess.check_output(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=64x64:r=8',
+        '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono', '-t', '0.25', '-c:v', 'libx264', '-c:a', 'aac',
+        '-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4', 'pipe:1'])
+
+
+def fake_worker(folder, *, before='', after='', args=()):
+    code = '''import hashlib,json,pathlib,sys,time,wave
 p=pathlib.Path(sys.argv[1])
 (p/'progress.json').write_text(json.dumps({'active_stages':['render'],'timings':{}}))
 time.sleep(.1)
 artifacts={}
-for name,filename in [('mv','mv.mp4'),('instrumental','instrumental.wav'),('backing_vocals','backing.wav'),('lead_vocals','lead.wav')]:
-    data=b'0123456789';(p/filename).write_bytes(data)
+for name,filename in [('mv','mv.mp4'),('instrumental','instrumental.wav'),('backing_vocals','backing.wav'),('lead_vocals','lead.wav'),('subtitles','cues.json')]:
+    path=p/filename
+    if name=='mv': path.write_bytes(bytes.fromhex(sys.argv[-1]))
+    elif name=='subtitles': path.write_text(json.dumps([{'text':'Hi','start':0,'end':.25,'units':[]}]))
+    else:
+        with wave.open(str(path),'wb') as track:
+            track.setparams((1,2,16000,4000,'NONE','not compressed'))
+            track.writeframes(bytes(8000))
+    data=path.read_bytes()
     artifacts[name]={'path':filename,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
-(p/'result.json').write_text(json.dumps({'artifacts':artifacts}))
+(p/'result.json').write_text(json.dumps({'artifacts':artifacts,'duration_seconds':.25,'shared_preview_gain':1.}))
 '''
-    return [sys.executable, '-c', code, str(folder)]
+    return [sys.executable, '-c', before+'\n'+code+'\n'+after, str(folder), *args, fixture_video().hex()]
 
 
 def finished(client, job_id):
@@ -122,7 +137,7 @@ def test_bad_progress_messages_preserve_the_worker_and_valid_result(tmp_path):
         job_id = client.post('/v1/jobs', json={'url':URL}).json()['id']
         job = finished(client, job_id)
         assert job['status'] == 'completed' and job['song_info']['title'] == 'Kept metadata'
-        assert client.get(f'/v1/jobs/{job_id}/artifacts/mv').content == b'0123456789'
+        assert client.get(f'/v1/jobs/{job_id}/artifacts/mv').content == fixture_video()
 
 
 @pytest.mark.parametrize('value,expected', [
@@ -164,7 +179,7 @@ def test_retired_sources_cannot_start_work_but_cached_media_remain_readable(tmp_
         original = {**job['input'], 'url':url}
         app.state.store.update(job['id'], input=original)
         assert client.get('/v1/room').status_code == 200
-        assert client.get(f"/v1/jobs/{job['id']}/artifacts/mv").content == b'0123456789'
+        assert client.get(f"/v1/jobs/{job['id']}/artifacts/mv").content == fixture_video()
         assert client.post('/v1/room/entries', json={'job_id':job['id']}).status_code == 201
         assert client.post('/v1/room/commands', json={'action':'reprepare', 'entry_id':entry['id']}).status_code == 422
         assert client.post('/v1/room/entries', json={'job_id':job['id'], 'force':True}).status_code == 422
@@ -189,7 +204,7 @@ def test_optional_cover_failure_does_not_hide_valid_media(tmp_path, missing):
         assert job['status'] == ('completed' if missing == 'poster' else 'failed')
         if missing == 'poster':
             assert 'poster' not in job['result']['artifacts']
-            assert client.get(f'/v1/jobs/{job_id}/artifacts/mv').content == b'0123456789'
+            assert client.get(f'/v1/jobs/{job_id}/artifacts/mv').content == fixture_video()
 
 
 def test_submission_outputs_cache_and_range_requests(tmp_path):
@@ -207,7 +222,7 @@ def test_submission_outputs_cache_and_range_requests(tmp_path):
         artifact = job['result']['artifacts']['mv']
         assert 'path' not in artifact and artifact['url'].endswith('/artifacts/mv?v=' + artifact['sha256'])
         response = client.get(artifact['url'], headers={'Range': 'bytes=2-5'})
-        assert response.status_code == 206 and response.content == b'2345'
+        assert response.status_code == 206 and response.content == fixture_video()[2:6]
         assert client.get(f'/v1/jobs/{job_id}/artifacts/request.json').status_code == 404
         cached = client.post('/v1/jobs', json={'url': URL})
         assert cached.status_code == 200 and cached.json()['id'] == job_id
@@ -215,6 +230,29 @@ def test_submission_outputs_cache_and_range_requests(tmp_path):
         repaired = client.post('/v1/jobs', json={'url': URL})
         assert repaired.status_code == 202 and repaired.json()['id'] != job_id
         assert finished(client, repaired.json()['id'])['status'] == 'completed'
+
+
+@pytest.mark.parametrize('fault', ['missing', 'same_size', 'empty'])
+def test_invalid_subtitles_never_publish_a_ready_queue_entry(tmp_path, fault):
+    def worker(folder):
+        after = """r=json.loads((p/'result.json').read_text()); a=r['artifacts']
+if sys.argv[2]=='missing': del a['subtitles']
+elif sys.argv[2]=='same_size':
+    (p/'cues.json').write_bytes((p/'cues.json').read_bytes().replace(b'Hi',b'Ho'))
+else:
+    (p/'cues.json').write_text('[]')
+    a['subtitles'].update(bytes=2,sha256=hashlib.sha256(b'[]').hexdigest())
+(p/'result.json').write_text(json.dumps(r))
+"""
+        return fake_worker(folder, after=after, args=(fault,))
+    app = create_app(tmp_path, worker_command=worker, version='test')
+    with TestClient(app) as client:
+        entry = client.post('/v1/room/entries', json={'url':URL}).json()['entries'][0]
+        job = finished(client, entry['job_id'])
+        assert job['status'] == 'failed' and job['error']['code'] == 'worker_error'
+        after = client.get('/v1/room').json()['entries'][0]
+        assert after['id'] == entry['id'] and after['status'] == 'failed'
+        assert client.get(f"/v1/jobs/{job['id']}/artifacts/subtitles").status_code == 409
 
 
 @pytest.mark.parametrize('rate,playback_rate', [(16000,48000), (44100,48000), (48000,44100)])
@@ -5624,7 +5662,7 @@ def test_waiting_stages_follow_playlist_priority_without_interrupting_work(tmp_p
 
     from karaoke.api import Worker
     worker = Worker(Store(tmp_path), concurrency=None)
-    worker.prioritize(['next', 'later'])
+    worker.prioritize(['earlier', 'earlier', 'earlier', 'next'])  # "later" is outside the playlist.
     monkeypatch.setenv('KARAOKE_STAGE_LOCK_DIR', str(tmp_path/'stage-locks'))
     blocker, later, next_song = [Pipeline(dict(url=URL), tmp_path/name) for name in ('running', 'later', 'next')]
     started, release = threading.Event(), threading.Event()
@@ -5736,11 +5774,8 @@ with pipeline.stage_slot(stage):
     (p/'entered').touch()
     while not (p.parent/'release-all').exists() and not (p/'release').exists(): time.sleep(.01)
     pipeline.phase(stage,False)
-(p/'media').write_text('ok')
-(p/'result.json').write_text(json.dumps({'artifacts':{n:{'path':'media','bytes':2}
-    for n in ['mv','instrumental','backing_vocals','lead_vocals']}}))
 """
-    command = lambda folder: [sys.executable, '-u', '-c', code, str(folder), source]
+    command = lambda folder: fake_worker(folder, before=code, args=(source,))
     pause = tmp_path/'preparation.pause'
     pause.write_text('interactive repair owns this pause')
     app = create_app(tmp_path, worker_command=command, version='test', worker_concurrency=None)
@@ -8097,21 +8132,24 @@ def test_changed_published_readings_invalidate_both_render_caches(tmp_path, monk
     path = tmp_path/'lyric-readings.json'
     path.write_text('first reading')
     monkeypatch.setattr(readings, 'prepare_readings', lambda *a: path)
-    result = dict(title='Example', artist='Artist', language='Japanese', duration_seconds=3.,
+    result: dict[str, Any] = dict(title='Example', artist='Artist', language='Japanese', duration_seconds=3.,
                   artifacts={'subtitles': {'path': 'cues.json'}, 'mv': {'path': 'mv.mp4'}})
     renders = []
     def render(stage, command):
         assert command[command.index('--readings')+1] == path
         renders.append(path.read_text())
         (tmp_path/'captioned-picture.mp4').write_bytes(path.read_bytes())
-        (tmp_path/'captioned-picture.render.json').write_text('{}')
+        (tmp_path/'captioned-picture.render.json').write_text(json.dumps(
+            {'countdown': {'events': [dict(start=-3., onset=1.)]}, 'opening_countdown': dict(start=-3., onset=1.)}))
     def publish(result, picture=None):
         import shutil
         shutil.copyfile(pipeline.render_picture(result), tmp_path/'mv.mp4')
     monkeypatch.setattr(pipeline, 'run', render)
     monkeypatch.setattr(pipeline, 'render_uncached', publish)
     pipeline.render_video(result)
+    first_quality = result.pop('quality')
     pipeline.render_video(result)
+    assert result['quality'] == first_quality and result['quality']['opening_countdown']['start'] == -3.
     assert renders == ['first reading']
     path.write_text('corrected reading')
     pipeline.render_video(result)
@@ -9075,11 +9113,9 @@ while not (p/'release').exists(): time.sleep(.02)
 if (p/'fail').exists():
     (p/'error.json').write_text(json.dumps({'code':'fixture_failure','message':p.name}))
     sys.exit(1)
-(p/'media').write_text(p.name)
-artifacts={name:{'path':'media','bytes':len(p.name)} for name in ['mv','instrumental','backing_vocals','lead_vocals']}
-(p/'result.json').write_text(json.dumps({'artifacts':artifacts}))
+(p/'identity.log').write_text(p.name)
 '''
-        return [sys.executable, '-u', '-c', code, str(folder)]
+        return fake_worker(folder, before=code)
     app = create_app(tmp_path, worker_command=controlled_worker, version='test', worker_concurrency=concurrency,
                      cache_limit_bytes=1024**2)  # Tiny fixture files; storage limits are tested separately.
     active_count = concurrency or 5
@@ -9113,7 +9149,7 @@ artifacts={name:{'path':'media','bytes':len(p.name)} for name in ['mv','instrume
         (tmp_path/ids[-1]/'release').touch()
         assert finished(client, ids[-1])['status'] == 'completed'
         for j in ids[1:]:
-            assert (tmp_path/j/'media').read_text() == j
+            assert (tmp_path/j/'identity.log').read_text() == j
         assert client.get('/health').json()['running_jobs'] == []
 
 
@@ -10176,8 +10212,9 @@ def cache_fixture(store, suffix, *, restorable=False):
     if restorable:
         for name in ('instrumental', 'backing_vocals', 'lead_vocals', 'instrumental_preview',
                      'backing_vocals_preview', 'lead_vocals_preview', 'subtitles', 'poster'):
-            (folder/name).write_bytes(b'keep me')
-            result['artifacts'][name] = dict(path=name, bytes=7, sha256=file_hash(folder/name))
+            data = b'[{"text":"Hi","start":0,"end":1}]' if name == 'subtitles' else b'keep me'
+            (folder/name).write_bytes(data)
+            result['artifacts'][name] = dict(path=name, bytes=len(data), sha256=file_hash(folder/name))
         (folder/'result.json').write_text(json.dumps(result))
     return store.update(job['id'], status='completed', last_accessed_at='2020-01-0'+suffix,
                         result=result)
@@ -10215,6 +10252,46 @@ def test_lru_reclaims_unused_intermediates_before_an_older_video(tmp_path):
     assert not working.exists()
     assert all((tmp_path/job['id']/'mv.mp4').exists() for job in (first,second))
     assert all(store.read(job['id'])['status']=='completed' for job in (first,second))
+
+
+@pytest.mark.parametrize('corrupt', ['subtitles', 'lead_vocals'])
+def test_cache_keeps_good_video_when_retained_bytes_changed(tmp_path, monkeypatch, corrupt):
+    from karaoke import cache
+    ample = cache.shutil.disk_usage(tmp_path)._replace(free=10*GIB)
+    monkeypatch.setattr(cache.shutil, 'disk_usage', lambda _: ample)
+    store = Store(tmp_path)
+    job = cache_fixture(store, '1', restorable=True)
+    folder = tmp_path/job['id']
+    before = file_hash(folder/'mv.mp4')
+    path = folder/job['result']['artifacts'][corrupt]['path']
+    path.write_bytes(bytes(path.stat().st_size))
+    assert not can_restore_video(folder, job['result'], verify_hash=True)
+    store.cache.limit = store.cache.size(folder)-1
+    assert not store.cache.enforce()
+    assert file_hash(folder/'mv.mp4') == before
+    assert store.read(job['id'])['status'] == 'completed'
+    assert store.cache.stats['evictable_bytes'] == 0
+    with pytest.raises(StageFailure, match='保留的音轨或字幕不完整'):
+        Pipeline(job['input'], folder).restore_video()
+
+
+def test_pressure_sweep_scans_each_job_a_bounded_number_of_times(tmp_path, monkeypatch):
+    from karaoke import cache
+    store = Store(tmp_path, cache_limit_bytes=1)
+    ids = []
+    for index in range(32):
+        job, _ = store.create(JobRequest(url=f'https://youtu.be/{index:011d}'), 'test')
+        ids.append(job['id'])
+        store.update(job['id'], status='failed')
+    visits = []
+    scan = cache.file_sizes
+    def counted(folder):
+        visits.append(folder)
+        return scan(folder)
+    monkeypatch.setattr(cache, 'file_sizes', counted)
+    store.cache.enforce()
+    assert store.cache.stats['used_bytes'] == 0 and all(not (tmp_path/i).exists() for i in ids)
+    assert len(visits) <= 5*len(ids)
 
 
 def test_video_eviction_still_protects_queue_and_transfers(tmp_path):
@@ -10355,7 +10432,7 @@ result['artifacts']['mv'].update(bytes=8,sha256=hashlib.sha256(b'restored').hexd
         cached = client.post('/v1/jobs', json={**job['input'], 'force':False})
         assert cached.status_code == 200 and cached.json()['id'] == job['id']
         assert len(store.list()) == 1
-        assert all((folder/a['path']).read_bytes() == b'keep me'
+        assert all(file_hash(folder/a['path']) == a['sha256']
                    for name, a in job['result']['artifacts'].items() if name != 'mv')
 
 
@@ -11530,7 +11607,7 @@ def test_playback_cache_reuses_audio_but_rechecks_source_and_gain(tmp_path, monk
     for name in ('accompaniment', 'lead_vocals'):
         path = tmp_path/job['id']/f'{name}.flac'
         sf.write(path, np.full((16000, 2), .2), 16000, subtype='PCM_24')
-        job['result']['artifacts'][name] = dict(path=path.name, bytes=path.stat().st_size)
+        job['result']['artifacts'][name] = dict(path=path.name, bytes=path.stat().st_size, sha256=file_hash(path))
         paths.append(path)
     store.update(job['id'], result=job['result'])
     calls = []
@@ -11542,16 +11619,34 @@ def test_playback_cache_reuses_audio_but_rechecks_source_and_gain(tmp_path, monk
     monkeypatch.setattr('karaoke.api.playback_window_bytes', encode)
     url = f"/v1/jobs/{job['id']}/playback/accompaniment/0"
     with TestClient(app) as client:
-        first = client.get(url)
+        manifest = f"/v1/jobs/{job['id']}/playback"
+        version = client.get('/v1/library').json()['songs'][0]['playback_version']
+        assert version and client.get(manifest, params={'v':version}).json()['version'] == version
+        first = client.get(url, params={'v':version})
         assert first.status_code == 200
         assert client.get(url).content == first.content and len(calls) == 1
         job['result']['shared_preview_gain'] = .5
         store.update(job['id'], result=job['result'])
+        assert client.get(manifest, params={'v':version}).status_code == 409
+        assert client.get(url, params={'v':version}).status_code == 409
+        version = client.get(manifest).json()['version']
         quieter = client.get(url)
         assert quieter.status_code == 200 and quieter.content != first.content and len(calls) == 2
         sf.write(paths[0], np.full((16000, 2), .4), 16000, subtype='PCM_24')
-        replaced = client.get(url)
+        job['result']['artifacts']['accompaniment'].update(bytes=paths[0].stat().st_size, sha256=file_hash(paths[0]))
+        store.update(job['id'], result=job['result'])
+        assert client.get(manifest+'/lead_vocals/0', params={'v':version}).status_code == 409
+        replaced = client.get(url, params={'v':client.get(manifest).json()['version']})
         assert replaced.status_code == 200 and replaced.content != quieter.content and len(calls) == 3
+        decoded, _ = sf.read(io.BytesIO(replaced.content))
+        np.testing.assert_allclose(decoded, .2, atol=2**-22)
+        version = client.get(manifest).json()['version']
+        def republish_during_read(*args):
+            job['result']['shared_preview_gain'] = .25
+            store.update(job['id'], result=job['result'])
+            return playback_window_bytes(*args)
+        monkeypatch.setattr('karaoke.api.playback_window_bytes', republish_during_read)
+        assert client.get(manifest+'/lead_vocals/0', params={'v':version}).status_code == 409
         paths[0].unlink()
         assert client.get(url).status_code == 409
         store.update(job['id'], status='evicted')

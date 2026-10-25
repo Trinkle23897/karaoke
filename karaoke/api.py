@@ -29,8 +29,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from .cache import GIB, CacheFull, SongCache, can_restore_video
-from .job_schema import JobRequest, download_backoff, playback_stems, retry_after_seconds
+from .cache import GIB, CacheFull, SongCache, can_restore_video, valid_artifact
+from .job_schema import (
+    JobRequest,
+    download_backoff,
+    playback_stems,
+    playback_version,
+    preparation_rank,
+    retry_after_seconds,
+)
 from .job_schema import retry_fields as source_retry_fields
 from .lyric_availability import LyricAvailability
 from .room import AddSong, Room, RoomCommand, Updates, artifact_url
@@ -102,6 +109,30 @@ def playback_window_bytes(path, info, chunk, gain):
 
 def now():
     return datetime.now(UTC).isoformat()
+
+
+def job_cache_key(payload, version):
+    inputs = {key: value for key, value in payload.items() if key != 'force'}
+    return hashlib.sha256(json.dumps([version, inputs], sort_keys=True).encode()).hexdigest()
+
+
+def validated_result(folder):
+    result = json.loads((folder/'result.json').read_text())
+    artifacts = result['artifacts']
+    if not {'mv', 'subtitles', *playback_stems(artifacts)} <= artifacts.keys():
+        raise ValueError('Pipeline omitted a required output')
+    for name, artifact in list(artifacts.items()):
+        if not valid_artifact(folder, artifact, verify_hash=True):
+            if name == 'poster':
+                logging.getLogger(__name__).warning('Job %s: optional poster unavailable', folder.name)
+                del artifacts[name]
+            else:
+                raise ValueError(f'Invalid result artifact: {name}')
+    cues = json.loads((folder/artifacts['subtitles']['path']).read_text())
+    if not isinstance(cues, list) or not cues or not all(
+            cue['text'].strip() and 0 <= cue['start'] < cue['end'] <= result['duration_seconds']+.001 for cue in cues):
+        raise ValueError('No usable subtitle timeline')
+    return result
 
 
 class AudioWindowCache:
@@ -214,8 +245,7 @@ class Store:
                     fields['metadata_cache'] = metadata
             doc.update(fields, updated_at=now())
             if 'pipeline_version' in fields:
-                payload = {key: value for key, value in doc['input'].items() if key != 'force'}
-                cache_key = hashlib.sha256(json.dumps([doc['pipeline_version'], payload], sort_keys=True).encode()).hexdigest()
+                cache_key = job_cache_key(doc['input'], doc['pipeline_version'])
                 db.execute('UPDATE jobs SET cache_key=? WHERE id=?', (cache_key, job_id))
             db.execute('UPDATE jobs SET status=?, doc=? WHERE id=?',
                        (doc['status'], json.dumps(doc, ensure_ascii=False), job_id))
@@ -237,17 +267,45 @@ class Store:
             if len(self.access_times) > 1024:
                 self.access_times.popitem(last=False)
 
+    def requeue(self, db, doc, key, version):
+        folder = self.cache.folder(doc['id'])
+        folder.mkdir(exist_ok=True)
+        (folder/'request.json').write_text(json.dumps(doc['input'], ensure_ascii=False)+'\n')
+        if not doc.get('restore_video'):
+            doc['pipeline_version'] = version
+        if not doc.get('restore_video') or doc['status'] == 'failed':
+            doc['attempt_count'] = doc.get('attempt_count', 1)+1
+        if doc.get('download_retry'):
+            doc['download_retry'].update(count=0, next_retry_at=None)
+        stamp = now()
+        doc.update(status='queued', active_stages=[], stage_progress={}, timings={}, error=None,
+                   updated_at=stamp, last_accessed_at=stamp)
+        db.execute('UPDATE jobs SET cache_key=?, status=?, doc=? WHERE id=?',
+                   (key, 'queued', json.dumps(doc, ensure_ascii=False), doc['id']))
+        return doc
+
+    def retry(self, job_id, version):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT doc FROM jobs WHERE id=? AND status='failed'", (job_id,)).fetchone()
+            if not row:
+                raise HTTPException(409, '原任务状态已改变')
+            doc = json.loads(row[0])
+            if doc.get('restore_video') and not can_restore_video(self.cache.folder(job_id), doc.get('result')):
+                raise HTTPException(409, '保留的音轨或字幕不完整，无法补回视频')
+            return self.requeue(db, doc, job_cache_key(doc['input'], version), version)
+
     def create(self, payload, version):
         key_payload = payload.model_dump(exclude={'force'})
-        key = hashlib.sha256(json.dumps([version, key_payload], sort_keys=True).encode()).hexdigest()
+        key = job_cache_key(key_payload, version)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             if not payload.force:
-                rows = db.execute("""SELECT doc FROM jobs WHERE
-                    (cache_key=? AND status IN ('queued','running','completed'))
-                    OR status IN ('queued','failed','cancelled','audio_ready','source_ready','completed') OR json_extract(doc, '$.restore_video')=1
+                rows = db.execute("""SELECT doc FROM jobs WHERE json_extract(doc, '$.input.url')=? AND (
+                    (cache_key=? AND status='running') OR status IN ('queued','failed','cancelled','audio_ready','source_ready','completed')
+                    OR json_extract(doc, '$.restore_video')=1)
                     ORDER BY (cache_key=?) DESC, (status='completed') DESC,
-                             COALESCE(json_extract(doc, '$.restore_video'), 0) DESC, created_at DESC""", (key, key)).fetchall()
+                             COALESCE(json_extract(doc, '$.restore_video'), 0) DESC, created_at DESC""", (payload.url, key, key))
                 for row in rows:
                     doc = json.loads(row[0])
                     if {k: v for k, v in doc['input'].items() if k != 'force'} != key_payload:
@@ -270,28 +328,13 @@ class Store:
                         if (not source_ready and doc['status'] != 'cancelled'
                                 and not any((folder/'checkpoints').glob('*.json'))):
                             continue
-                        doc.update(status='queued', active_stages=[], stage_progress={}, timings={},
-                                   error=None, updated_at=now(), last_accessed_at=now(), pipeline_version=version,
-                                   attempt_count=doc.get('attempt_count', 1)+1)
-                        if doc.get('download_retry'):
-                            doc['download_retry']['count'] = 0
-                        (folder/'request.json').write_text(json.dumps(doc['input'], ensure_ascii=False)+'\n')
-                        db.execute('UPDATE jobs SET cache_key=?, status=?, doc=? WHERE id=?',
-                                   (key, 'queued', json.dumps(doc, ensure_ascii=False), doc['id']))
-                        return doc, False
+                        return self.requeue(db, doc, key, version), False
                     if doc.get('restore_video'):
                         if doc['status'] not in ('queued', 'running'):
                             folder = self.root/doc['id']
                             if not can_restore_video(folder, doc.get('result')):
                                 continue
-                            doc.update(status='queued', active_stages=[], stage_progress={}, timings={},
-                                       error=None, updated_at=now(), last_accessed_at=now())
-                            if doc.get('download_retry'):
-                                doc['download_retry']['count'] = 0
-                            (folder/'request.json').write_text(json.dumps(doc['input'], ensure_ascii=False)+'\n')
-                            db.execute('UPDATE jobs SET cache_key=?, status=?, doc=? WHERE id=?',
-                                       (key, 'queued', json.dumps(doc, ensure_ascii=False), doc['id']))
-                            return doc, False
+                            return self.requeue(db, doc, key, version), False
                     if doc['status'] != 'completed' or all(
                             (self.root/doc['id']/item['path']).is_file()
                             for name, item in doc['result']['artifacts'].items() if name != 'poster'):
@@ -302,7 +345,7 @@ class Store:
             doc: dict[str, Any] = dict(id=job_id, status='queued', active_stages=[], created_at=stamp, updated_at=stamp,
                        last_accessed_at=stamp, input=payload.model_dump(), result=None, error=None, pipeline_version=version)
             previous = db.execute("SELECT doc FROM jobs WHERE json_extract(doc, '$.input.url')=? ORDER BY created_at DESC",
-                                  (payload.url,)).fetchall()
+                                  (payload.url,))
             for row in previous:
                 old = json.loads(row[0])
                 info = known_song_info(old)
@@ -394,7 +437,7 @@ class Worker:
         while not self.queue.empty():
             pending.append(self.queue.get_nowait())
             self.queue.task_done()
-        rank = {job_id: index for index, job_id in reversed(list(enumerate(job_ids)))}
+        rank = preparation_rank(job_ids)
         for job_id in sorted(dict.fromkeys(pending), key=lambda key: rank.get(key, len(rank))):
             job = self.store.read(job_id) or {}
             if job.get('status') == 'queued':
@@ -591,17 +634,7 @@ class Worker:
                 await self.supervise(log, job_id, process)
             result_path = folder/'result.json'
             if process.returncode == 0 and result_path.exists():
-                result = json.loads(result_path.read_text())
-                if not {'mv', *playback_stems(result['artifacts'])} <= result['artifacts'].keys():
-                    raise ValueError('Pipeline omitted a required output')
-                for name, artifact in list(result['artifacts'].items()):
-                    path = (folder/artifact['path']).resolve()
-                    if not path.is_relative_to(folder) or not path.is_file() or path.stat().st_size != artifact['bytes']:
-                        if name == 'poster':
-                            logging.getLogger(__name__).warning('Job %s: optional poster unavailable', job_id)
-                            result['artifacts'].pop(name)
-                            continue
-                        raise ValueError('Invalid result artifact')
+                result = await asyncio.to_thread(validated_result, folder)
                 self.store.update(job_id, status='completed', active_stages=[], result=result, restore_video=False, error=None,
                                   completed_at=now(), last_accessed_at=now())
             else:
@@ -917,7 +950,7 @@ def create_app(data_dir=None, *, worker_command=None, version=None, cache_limit_
             raise
         return response
 
-    def read_playback_window(job_id, stem, chunk, sample_rate):
+    def read_playback_window(job_id, stem, chunk, sample_rate, version):
         key = str(job_id)
         doc = store.read(key)
         if doc is None:
@@ -926,21 +959,34 @@ def create_app(data_dir=None, *, worker_command=None, version=None, cache_limit_
             raise HTTPException(410, '歌曲缓存已回收，请重新点歌')
         if doc['status'] != 'completed':
             raise HTTPException(409, '歌曲尚未准备完成')
+        current_version = playback_version(doc['result'])
+        if version is not None and version != current_version:
+            raise HTTPException(409, '歌曲音轨已更新，请重新加载')
         names = playback_stems(doc['result']['artifacts'])
         if chunk < 0 or stem is not None and stem not in names:
             raise HTTPException(404, 'Unknown audio window')
         if stem is not None:
             store.touch(key)
+        def check_publication():
+            if current_version is not None:
+                latest = store.read(key)
+                if not latest or latest['status'] != 'completed' or playback_version(latest['result']) != current_version:
+                    raise HTTPException(409, '歌曲音轨已更新，请重新加载')
         try:
             paths, info = playback_sources(store.cache.folder(key), doc['result'], sample_rate)
             if stem is None:
-                return info
+                check_publication()
+                return {**info, 'version': current_version}
             path = paths[names.index(stem)]
             stamp = path.stat()
             gain = doc['result']['shared_preview_gain']
-            cache_key = (path, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns, gain, chunk,
+            cache_key = (current_version, path, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns, gain, chunk,
                    *(info[name] for name in ('sample_rate', 'channels', 'frames', 'chunk_frames', 'padding_frames')))
-            data = playback_windows.get(cache_key, lambda: playback_window_bytes(path, info, chunk, gain))
+            def encode():
+                data = playback_window_bytes(path, info, chunk, gain)
+                check_publication()  # A replacement during decoding must not enter the old cache.
+                return data
+            data = playback_windows.get(cache_key, encode)
             return Response(data, media_type='audio/flac', headers={'Cache-Control': 'no-store'})
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
             raise HTTPException(409, '播放音轨不完整，请重新准备') from error
@@ -948,13 +994,13 @@ def create_app(data_dir=None, *, worker_command=None, version=None, cache_limit_
     @app.get('/v1/jobs/{job_id}/playback')
     @app.get('/v1/jobs/{job_id}/playback/{stem}/{chunk}')
     async def playback_window(job_id: UUID, stem: str | None = None, chunk: int = 0,
-                              sample_rate: int = Query(48000, ge=8000, le=192000)):
+                              sample_rate: int = Query(48000, ge=8000, le=192000), v: str | None = None):
         # Workers take the next window without waiting for the busy event loop
         # to release a semaphore. Keep encoding separate from file transfers.
         key = str(job_id)
         store.cache.acquire(key, record_access=False)
         try:
-            work = playback_pool.submit(read_playback_window, job_id, stem, chunk, sample_rate)
+            work = playback_pool.submit(read_playback_window, job_id, stem, chunk, sample_rate, v)
         except BaseException:
             store.cache.release(key)
             raise

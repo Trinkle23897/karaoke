@@ -11,12 +11,22 @@ from typing import TypedDict
 from uuid import UUID
 
 from .job_schema import playback_stems
-from .stage_cache import retained_files
+from .stage_cache import digest, retained_files
 
 GIB = 1024**3
 
 
-def can_restore_video(folder, result):
+def valid_artifact(folder, artifact, *, verify_hash):
+    try:
+        path = folder/artifact['path']
+        return (path.resolve() == path and path.is_relative_to(folder) and path.is_file() and
+                path.stat().st_size == artifact['bytes'] > 0 and
+                (not verify_hash or digest(path) == artifact.get('sha256')))
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        return False
+
+
+def can_restore_video(folder, result, *, verify_hash=False):
     """Only discard an MV when its expensive inputs and source identity survive."""
     try:
         artifacts = result['artifacts']
@@ -25,22 +35,58 @@ def can_restore_video(folder, result):
             return False
         if not result['language'] or not 0 < result['shared_preview_gain'] <= 1 or result['duration_seconds'] <= 0:
             return False
-        video = (folder/artifacts.get('mv', {'path':'mv.mp4'})['path']).resolve()
-        if not video.is_relative_to(folder):
+        video = folder/artifacts.get('mv', {'path':'mv.mp4'})['path']
+        if video.resolve() != video or not video.is_relative_to(folder):
             return False
         for name, artifact in artifacts.items():
             if name in ('mv', 'poster'):
                 continue
-            path = (folder/artifact['path']).resolve()
-            if path == video or not path.is_relative_to(folder) or not path.is_file() or path.stat().st_size != artifact['bytes']:
+            path = folder/artifact['path']
+            if path == video or not valid_artifact(folder, artifact, verify_hash=verify_hash):
                 return False
         return True
-    except (KeyError, TypeError, OSError):
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
         return False
 
 
 class CacheFull(RuntimeError):
     pass
+
+
+def file_sizes(folder):
+    """Count a hard-linked inode once per folder, even while a worker cleans up."""
+    files = {}
+    items = [(folder.parent, [], [folder.name])] if folder.is_file() else os.walk(folder, followlinks=False)
+    for parent, _, names in items:
+        for name in names:
+            try:
+                info = os.stat(os.path.join(parent, name), follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            files[info.st_dev, info.st_ino] = info.st_size
+    return files
+
+
+class CacheUsage:
+    """One inventory per sweep. Only rescan a job whose files we changed."""
+    def __init__(self):
+        self.folders = {}
+        self.references = Counter()
+        self.sizes = {}
+        self.used = 0
+
+    def refresh(self, folder):
+        for inode in self.folders.get(folder, {}):
+            self.references[inode] -= 1
+            if not self.references[inode]:
+                self.used -= self.sizes.pop(inode)
+                del self.references[inode]
+        files = self.folders[folder] = file_sizes(folder)
+        for inode, size in files.items():
+            self.references[inode] += 1
+            self.used += size - self.sizes.get(inode, 0)
+            self.sizes[inode] = size
+        return sum(files.values())
 
 
 class CacheStats(TypedDict, total=False):
@@ -86,25 +132,14 @@ class SongCache:
         return path
 
     @staticmethod
-    def size(folder, seen=None):
-        seen = set() if seen is None else seen
-        total = 0
-        items = [(folder.parent, [], [folder.name])] if folder.is_file() else os.walk(folder, followlinks=False)
-        for parent, _, names in items:
-            for name in names:
-                try:
-                    info = os.stat(os.path.join(parent, name), follow_symlinks=False)
-                    key = info.st_dev, info.st_ino
-                    if key not in seen:
-                        total += info.st_size
-                        seen.add(key)
-                except FileNotFoundError:  # A running worker may have just removed a temporary file.
-                    pass
-        return total
+    def size(folder):
+        return sum(file_sizes(folder).values())
 
     def total_size(self, folders):
-        seen = set()
-        return sum(self.size(folder, seen) for folder in folders)
+        sizes = {}
+        for folder in folders:
+            sizes.update(file_sizes(folder))
+        return sum(sizes.values())
 
     def protected(self, jobs):
         ids = {j['id'] for j in jobs if j['status'] in ('queued', 'running')}
@@ -145,12 +180,12 @@ class SongCache:
         except (OSError, ValueError, KeyError):
             return set()
 
-    def compact(self, job, *, source_only=False):
+    def compact(self, job, *, source_only=False, deduplicate=True):
         """Keep published outputs and bounded diagnostics; discard working audio."""
         folder = self.folder(job['id'])
         audio = job.get('audio_result')
-        audio_complete = job['status'] == 'audio_ready' and can_restore_video(folder, audio)
-        result = audio if audio_complete else job.get('result') or {}
+        audio_complete = job['status'] == 'audio_ready' and can_restore_video(folder, audio, verify_hash=True)
+        result = audio if job['status'] == 'audio_ready' and audio else job.get('result') or {}
         keep = {'request.json', 'result.json', 'audio-result.json', 'error.json', 'worker.log', 'lyric-crosscheck.json',
                 'captioned-picture.render.json', 'lyric-readings.json', 'song-language.json', 'song-language-error.json',
                 'song-metadata.json', 'checkpoints/extract_song_metadata.json',
@@ -195,7 +230,7 @@ class SongCache:
                     path.write_bytes(tail)
             elif path.is_dir() and not any(path.iterdir()):
                 path.rmdir()
-        if not source_only and job['status'] == 'completed':
+        if deduplicate and not source_only and job['status'] == 'completed':
             self.deduplicate(job)
 
     def deduplicate(self, job):
@@ -220,7 +255,7 @@ class SongCache:
                     continue
                 if os.path.samefile(source, path):
                     break
-                if any(self.media_hash(p) != artifact['sha256'] for p in (source, path)):
+                if any(digest(p) != artifact['sha256'] for p in (source, path)):
                     continue
                 temporary = path.with_suffix(path.suffix+'.shared-tmp')
                 try:
@@ -233,18 +268,14 @@ class SongCache:
                     temporary.unlink(missing_ok=True)
                 break
 
-    @staticmethod
-    def media_hash(path):
-        with path.open('rb') as stream:
-            return hashlib.file_digest(stream, 'sha256').hexdigest()
-
     def reuse_download(self, folder, url):
         """A retry can reuse a verified local download even if the website is unavailable."""
-        for job in reversed(self.store.list(-1)):
-            if job['input']['url'] != url or job['status'] not in (
-                    'failed', 'cancelled', 'source_ready', 'audio_ready', 'completed', 'video_evicted'):
-                continue
-            source = self.folder(job['id'])
+        with self.store.connect() as db:
+            sources = db.execute("""SELECT id FROM jobs WHERE json_extract(doc, '$.input.url')=? AND
+                status IN ('failed','cancelled','source_ready','audio_ready','completed','video_evicted')
+                ORDER BY created_at DESC""", (url,)).fetchall()
+        for (job_id,) in sources:
+            source = self.folder(job_id)
             try:
                 metadata = json.loads((source/'source.json').read_text())
                 info = json.loads((source/'download/source.info.json').read_text())
@@ -266,19 +297,19 @@ class SongCache:
     def enforce(self, reserve=0):
         jobs = self.store.list(-1)
         protected = self.protected(jobs)
-        sizes = {j['id']: self.size(self.folder(j['id'])) for j in jobs}
-        used = self.total_size(self.folder(j['id']) for j in jobs)
+        usage = CacheUsage()
+        sizes = {j['id']: usage.refresh(self.folder(j['id'])) for j in jobs}
         free = shutil.disk_usage(self.store.root).free
+        under_pressure = not self.within_limit(usage.used + reserve) or free < self.minimum_free + reserve
         candidates = sorted((j for j in jobs if j['id'] not in protected and
                              j['status'] in ('completed', 'video_evicted', 'failed', 'cancelled', 'evicted', 'audio_ready', 'source_ready')),
                             key=lambda j: (j.get('last_accessed_at', j['created_at']), j['id']))
         # Discard unused working files before evicting any playable media.
         for job in candidates:
-            if self.within_limit(used + reserve) and free >= self.minimum_free + reserve:
+            if self.within_limit(usage.used + reserve) and free >= self.minimum_free + reserve:
                 break
-            self.compact(job)
-            sizes[job['id']] = self.size(self.folder(job['id']))
-            used = self.total_size(self.folder(j['id']) for j in jobs)
+            self.compact(job, deduplicate=False)
+            sizes[job['id']] = usage.refresh(self.folder(job['id']))
             free = shutil.disk_usage(self.store.root).free
         retained = {}
         for job in candidates:
@@ -292,7 +323,7 @@ class SongCache:
                 retained[job['id']] += min(size, 65536) if name.endswith('.log') else size
         # Exhaust cheap-to-rebuild video before discarding any computed audio/timings.
         for job in candidates:
-            if self.within_limit(used + reserve) and free >= self.minimum_free + reserve:
+            if self.within_limit(usage.used + reserve) and free >= self.minimum_free + reserve:
                 break
             folder = self.folder(job['id'])
             if job['status'] in ('failed', 'audio_ready', 'source_ready') and (folder/'download/source.mkv').is_file():
@@ -304,40 +335,45 @@ class SongCache:
                 if audio_only or retained[job['id']]:
                     continue  # Keep pure audio and every required offline input.
                 video = folder/'download/source.mkv'
-            elif job['status'] == 'completed' and can_restore_video(folder, job.get('result')):
-                video = folder/job['result']['artifacts']['mv']['path']
+            elif job['status'] == 'completed':
+                result = job['result'] or {}
+                artifacts = result.get('artifacts', {})
+                if (not {'mv', 'subtitles', *playback_stems(artifacts)} <= artifacts.keys() or
+                        not (result.get('reconstruction') or {}).get('source_pcm_sha256')):
+                    continue
+                if not can_restore_video(folder, result, verify_hash=True):
+                    protected.add(job['id'])  # Its MV may be the only intact playable copy.
+                    continue
+                video = folder/artifacts['mv']['path']
             else:
                 continue
-            size = video.stat().st_size if video.is_file() else 0
             video.unlink(missing_ok=True)
-            used = self.total_size(self.folder(j['id']) for j in jobs)
-            sizes[job['id']] -= size
+            sizes[job['id']] = usage.refresh(folder)
             free = shutil.disk_usage(self.store.root).free
             if job['status'] == 'completed':
                 job.update(status='video_evicted', restore_video=True)
                 self.store.update(job['id'], status='video_evicted', restore_video=True, evicted_at=time.time())
         for job in candidates:
-            if self.within_limit(used + reserve) and free >= self.minimum_free + reserve:
+            if self.within_limit(usage.used + reserve) and free >= self.minimum_free + reserve:
                 break
             size = sizes[job['id']]
-            if size <= retained[job['id']]:
+            if job['id'] in protected or size <= retained[job['id']]:
                 continue
             folder = self.folder(job['id'])
             if retained[job['id']]:
                 self.compact(job, source_only=True)
-                remaining = self.size(folder)
-                retained[job['id']] = remaining
                 self.store.update(job['id'], status='source_ready', result=None, audio_result=None,
                                   restore_video=False, active_stages=[], evicted_at=time.time())
             else:
                 shutil.rmtree(folder)
-                remaining = 0
                 self.store.update(job['id'], status='evicted' if job.get('result') or job.get('audio_result') else job['status'],
                                   restore_video=False, active_stages=[], evicted_at=time.time())
-            used = self.total_size(self.folder(j['id']) for j in jobs)
-            sizes[job['id']] = remaining
+            usage.refresh(folder)
             free = shutil.disk_usage(self.store.root).free
-        candidate_ids = {j['id'] for j in candidates}
+        # Active jobs can grow while other folders are being reclaimed.
+        used = self.total_size(self.folder(j['id']) for j in jobs) if under_pressure else usage.used
+        free = shutil.disk_usage(self.store.root).free if under_pressure else free
+        candidate_ids = {j['id'] for j in candidates} - protected
         retained_paths = [self.folder(j['id'])/name for j in candidates for name in self.source_files(j)]
         blocked = self.total_size([self.folder(j['id']) for j in jobs if j['id'] not in candidate_ids] + retained_paths)
         evictable = max(0, used-blocked)

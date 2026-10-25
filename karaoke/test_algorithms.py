@@ -1577,6 +1577,10 @@ class SubtitleIntegrity(unittest.TestCase):
         self.assertEqual([e['onset'] for e in countdown_events([dict(units=units)])],[1.,9.])
         units[0]=dict(start=1.,end=9.,emission_end=1.05,timing_evidence='ctc_event')
         self.assertEqual([e['onset'] for e in countdown_events([dict(units=units)])],[1.])
+        overlap = [dict(start=0., end=15.), units[0], dict(start=2., end=3.), dict(start=10., end=11.)]
+        self.assertEqual([e['onset'] for e in countdown_events([dict(units=overlap)])], [0.])
+        overlap[0]['end'] = .5
+        self.assertEqual([e['onset'] for e in countdown_events([dict(units=overlap)])], [0.,10.])
 
     def test_playback_timing_groups_only_uncertain_words_between_measured_boundaries(self):
         from copy import deepcopy

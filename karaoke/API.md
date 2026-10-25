@@ -44,7 +44,7 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 网页不使用服务端的 `current_id`、`playing`、`position`、`started_at`、`mix`、`levels`、`pitch_semitones` 控制播放。这些旧 API 字段仅为兼容保留；网页的播放命令、媒体就绪握手和缓冲处理全部在设备本地进行。播放状态经 localStorage 在同一浏览器标签页间共享，只有取得发声权的标签页播放；搜索与页面导航状态保存在各标签页的 sessionStorage。刷新后仍受浏览器声音授权限制，不跟随其他设备起播。
 
-网页切歌或唱完时发送 `{"action":"finish","entry_id":"…","playback_started_at":…}`。实际起播时间为 Unix 秒；尚未开始则传 `null`，移除条目但不新增演唱历史。结束命令由浏览器持久保存到服务端确认，暂时失败后退避重试，刷新或标签页接管后继续发送。同一队列条目的重复完成是幂等操作，不能误删下一首。其他浏览器继续保留自己正在播放的条目。
+跳过仍在准备的歌只改变本机选曲，原条目留在待唱。已准备的歌切到下一首或唱完时发送 `finish`；明确点击「移除」发送 `remove`。两种命令都绑定 `entry_id`，浏览器保存原命令直到服务端确认，刷新后也可重试。同一条目只移除一次。实际起播时间 `playback_started_at` 以 Unix 秒计；尚未开唱时传 `null`，不新增已唱记录。
 
 `GET /v1/room/events?job_id=…` 在 SSE 存续期间保护本机当前歌曲的缓存，并在快照的 `playback_entry` 中推送该任务的最新元数据；即使该歌曲不再位于共享待唱列表，也保持可播放。关闭连接释放保护，连接和状态推送不刷新 LRU 访问时间。
 
@@ -68,7 +68,7 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 ### 分段播放
 
-`GET /v1/jobs/{id}/playback` 返回播放音轨列表 `stems` 及共有的 `sample_rate`、`channels`、`frames`、`chunk_frames`、`padding_frames`。仅允许已完成任务，音轨格式、共同增益或文件无效时拒绝播放。此元数据查询不刷新 LRU。
+`GET /v1/jobs/{id}/playback` 返回音轨列表 `stems`、音轨组合版本 `version`，以及共有的 `sample_rate`、`channels`、`frames`、`chunk_frames`、`padding_frames`。网页从待唱项或曲库取得 `playback_version`，在播放清单和每个片段请求中传入 `?v=该版本`。任何音轨或共同增益更新后，旧版本请求返回 409。元数据查询不刷新 LRU。
 
 `GET /v1/jobs/{id}/playback/{stem}/{chunk}` 返回单段 24-bit FLAC，`stem` 取自上述元数据的 `stems`，`chunk` 从零开始。两个请求都传入浏览器 AudioContext 的 `sample_rate`（默认 48000）。每段 8 秒，前后附加至少 20 ms 的重采样余量，边界同时落在源采样与浏览器采样的整数位置；按元数据裁掉重叠部分，并以整型源帧边界调度全部音轨。读取期间取得缓存租约，实际音频访问刷新 LRU（同一任务按一秒粒度合并持久化写入，活跃传输的租约仍逐个计数）；不写入新缓存文件，不触发预处理模型。
 

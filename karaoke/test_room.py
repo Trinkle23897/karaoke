@@ -106,6 +106,11 @@ def test_progress_snapshots_do_not_read_retired_attempts_after_database_upgrade(
     assert set(decoded) == {prepared['id'], active['id']}
     # Allow ample room for indexed queries and writes, but not a history scan.
     assert len(steps) < 200
+    decoded.clear()
+    steps.clear()
+    new, hit = store.create(JobRequest(url='https://youtu.be/NEW00000001'), 'test')
+    assert not hit and new['status'] == 'queued'
+    assert not decoded and len(steps) < 10  # Neither job matching nor download reuse scans history.
 
 
 @pytest.mark.parametrize('missing_newest_media', [False, True])
@@ -758,9 +763,9 @@ def test_pending_preparation_follows_playlist_without_interrupting_current(tmp_p
     worker.processes['already-running'] = None
     jobs = {name:store.create(JobRequest(url=f'https://youtu.be/{i:011d}'),'test')[0]['id']
             for i,name in enumerate(['a','b','c','standalone'])}
-    for job in [*jobs.values(), jobs['a'], 'missing-job']:
+    for job in [jobs['standalone'], *jobs.values(), jobs['a'], 'missing-job']:
         worker.queue.put_nowait(job)
-    worker.prioritize([jobs[name] for name in ['c','a','c','b']])
+    worker.prioritize([jobs[name] for name in ['c','c','a','a','b']])
     assert [worker.queue.get_nowait() for _ in range(4)] == [jobs[name] for name in ['c','a','b','standalone']]
     assert worker.queue.empty()
     assert worker.current == 'already-running'
@@ -902,13 +907,14 @@ with cache.stage('align',inputs=[separated],outputs=[aligned]) as hit:
         while not (p.parent/'release').exists(): time.sleep(.02)
         child.kill(); child.wait()
         aligned.write_bytes(b'complete')
-artifacts={name:{'path':'alignment.bin','bytes':len(aligned.read_bytes())}
-    for name in ['mv','instrumental','backing_vocals','lead_vocals']}
-(p/'result.json').write_text(json.dumps({'artifacts':artifacts,'reused_stages':cache.reused}))
+"""
+    after = """result=json.loads((p/'result.json').read_text())
+result['artifacts']['alignment']={'path':aligned.name,'bytes':aligned.stat().st_size,'sha256':hashlib.sha256(aligned.read_bytes()).hexdigest()}
+(p/'result.json').write_text(json.dumps(dict(result,reused_stages=cache.reused)))
 """
 
     async def scenario():
-        app = create_app(tmp_path, worker_command=lambda p: [sys.executable, '-u', '-c', code, str(p), child],
+        app = create_app(tmp_path, worker_command=lambda p: fake_worker(p, before=code, after=after, args=(child,)),
                          version='test', worker_concurrency=None)
         cached = ready_job(app.state.store) if force and readd_during_cancel else None
         worker = app.state.worker
@@ -1009,7 +1015,44 @@ def test_library_keeps_one_card_across_failed_jobs_and_retries(tmp_path):
     snapshot = room.command(RoomCommand(action='retry', entry_id=first['id']))
     songs = [s for s in snapshot['library'] if s['url'] == URL]
     assert len(songs) == 1 and songs[0]['status'] == 'queued'
-    assert songs[0]['job_id'] != job['id']
+    assert songs[0]['job_id'] == job['id'] and snapshot['entries'][0]['id'] == first['id']
+    assert store.read(job['id'])['attempt_count'] == 2
+
+
+def test_retry_without_checkpoint_finishes_original_job_despite_a_newer_attempt(tmp_path):
+    failures = []
+    def worker(folder):
+        if failures:
+            return fake_worker(folder)
+        failures.append(folder.name)
+        return [sys.executable, '-c', "import sys; sys.exit(1)"]
+    app = create_app(tmp_path, worker_command=worker, version='test')
+    with TestClient(app) as client:
+        entry = client.post('/v1/room/entries', json={'url':URL}).json()['entries'][0]
+        assert finished(client, entry['job_id'])['status'] == 'failed'
+        rival, _ = app.state.store.create(JobRequest(url=URL, force=True), 'test')
+        after = client.post('/v1/room/commands', json={'action':'retry', 'entry_id':entry['id']}).json()['entries'][0]
+        assert (after['id'], after['job_id']) == (entry['id'], entry['job_id'])
+        job = finished(client, entry['job_id'])
+        assert job['status'] == 'completed' and job['attempt_count'] == 2
+        assert app.state.store.read(rival['id'])['status'] == 'queued'
+        for artifact in job['result']['artifacts'].values():
+            assert hashlib.sha256(client.get(artifact['url']).content).hexdigest() == artifact['sha256']
+
+
+def test_browser_remove_is_idempotent_and_only_sung_entries_enter_history(tmp_path):
+    app = create_app(tmp_path, version='test')
+    client = TestClient(app)
+    waiting = client.post('/v1/room/entries', json={'url':URL}).json()['entries'][0]
+    ready = ready_job(app.state.store, 'https://youtu.be/00000000002')
+    singing = client.post('/v1/room/entries', json={'job_id':ready['id']}).json()['entries'][1]
+    for entry, started in ((waiting, None), (singing, 100.)):
+        command = {'action':'remove','entry_id':entry['id'],'playback_started_at':started}
+        first = client.post('/v1/room/commands', json=command).json()
+        again = client.post('/v1/room/commands', json=command).json()
+        assert again['revision'] == first['revision'] and again['history'] == first['history']
+        assert [song['id'] for song in first['history']] == ([] if started is None else [singing['id']])
+    assert again['entries'] == []
 
 
 def test_manual_retry_resumes_waiting_job_but_preserves_provider_backoff(tmp_path):

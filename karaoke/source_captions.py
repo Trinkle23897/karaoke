@@ -103,18 +103,22 @@ def caption_events(packet, language, duration):
     return events, None
 
 
+def caption_lines(events):
+    """Keep the publisher's lyric breaks; the renderer handles display width."""
+    from .song_sources import join_punctuation_lines
+
+    return join_punctuation_lines(line for event in events for line in event['text'].splitlines())
+
+
 def caption_candidate(packet, transcription, language, duration):
     """Check source text against audio; caption display times are never word times."""
     from rapidfuzz.distance import Levenshtein
 
-    from .song_sources import transcript_lines
     events, error = caption_events(packet, language, duration)
     if events is None:
         return None, error
     try:
-        # Caption display events can contain only musical notes or punctuation.
-        # Wrap the complete text so those symbols join an adjacent lyric line.
-        lines = transcript_lines(dict(segments=events), language)
+        lines = caption_lines(events)
         if not lines or len(lines) > 1000 or any(len(line) > 200 for line in lines):
             raise ValueError('Invalid lyric length')
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
@@ -134,7 +138,7 @@ def caption_candidate(packet, transcription, language, duration):
 def prepare_caption_lyrics(request, metadata, duration, cache, model):
     """Use manual same-recording text only after every omission is confirmed as speech."""
     from .lyric_lookup import text_language
-    from .song_sources import SongText, extract_song_metadata, transcript_lines, video_song_info
+    from .song_sources import SongText, extract_song_metadata, video_song_info
     from .vocal_review import review_gaps, speech_intervals
 
     song = video_song_info(metadata)
@@ -196,7 +200,7 @@ def prepare_caption_lyrics(request, metadata, duration, cache, model):
     report_path.write_text(json.dumps(dict(report, reviews=reviews), ensure_ascii=False)+'\n')
     if report['status'] != 'accepted':
         return None
-    lines = transcript_lines(dict(segments=picked), language)
+    lines = caption_lines(picked)
     detected = text_language(''.join(lines))
     if (not lines or len(lines) > 1000 or any(len(line) > 200 for line in lines) or
             detected != language and not (language == 'Cantonese' and detected == 'Chinese')):

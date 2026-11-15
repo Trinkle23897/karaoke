@@ -1105,7 +1105,7 @@ def test_manual_source_captions_are_cached_and_replace_an_asr_draft(tmp_path, mo
         'https://www.youtube.com/api/timedtext?v=n5sjpCQhTDk&lang=zh-Hant&fmt=json3')]})
     info = tmp_path/'info.json'
     info.write_text(json.dumps(metadata))
-    lines = ['微風裡慢慢歌唱', '星光下靜靜傾聽', '微風裡慢慢歌唱']
+    lines = ['微風裡慢慢歌唱', '沿著山邊的小路慢慢走著抬頭望見滿天星光', '微風裡慢慢歌唱']
     displayed = ['♪', lines[0], '♪♪♪', lines[1], lines[2], '…'] if formatting == 'symbols' else list(lines)
     expected = ['♪'+lines[0]+'♪♪♪', lines[1], lines[2]+'…'] if formatting == 'symbols' else lines
     if formatting == 'annotations':
@@ -1217,7 +1217,7 @@ def test_playback_caption_lyrics_keep_all_singing_and_review_omitted_dialogue(tm
     info = tmp_path/'download/source.info.json'
     info.parent.mkdir()
     info.write_text(json.dumps(metadata))
-    texts = ['今夜は二人に歌っていただきます', '風に吹かれて歌う', '星を見上げて歌う']
+    texts = ['今夜は二人に歌っていただきます', '広い公園の入り口で友達とゆっくり話したよ', '君と']
     document = dict(events=[dict(tStartMs=i*2000, dDurationMs=2500 if i == 0 and verdict == 'overlap' else 2000,
                      segs=[dict(utf8=text)]) for i,text in enumerate(texts)])
     monkeypatch.setattr(source_captions, 'read_document', lambda _:document)
@@ -9280,11 +9280,12 @@ def test_mixed_language_wrapping_does_not_split_a_word_at_punctuation():
 
 @pytest.mark.parametrize('language,phrase,tail', [
     ('Japanese', '別に大したことないよ 話すだけで十分だよ', 'よ'),
+    ('Japanese', '広い公園の入り口で友達とゆっくり話したよ', 'たよ'),
     ('Chinese', 'You should know about it', 'it'),
     ('English', 'One two three four five six seven eight nine ten eleven', 'eleven'),
     ('Chinese', '甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申。', '申。'),
 ])
-def test_asr_wrapping_keeps_a_singleton_tail_with_its_phrase(language, phrase, tail):
+def test_asr_wrapping_keeps_a_short_tail_with_its_phrase(language, phrase, tail):
     from copy import deepcopy
 
     from karaoke.song_sources import transcript_lines

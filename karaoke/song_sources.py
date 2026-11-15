@@ -66,7 +66,8 @@ def transcript_lines(transcription, language):
                 size += weight
             # A width boundary must not strand a sung suffix on its own.
             # Rebalance only the final pair, retaining tokens and phrase bounds.
-            if len(chunks) > 1 and sum(any(c.isalnum() for c in t) for t in chunks[-1]) == 1:
+            if len(chunks) > 1 and 2*sum(any(c.isalnum() for c in t) for t in chunks[-1]) < sum(
+                    any(c.isalnum() for c in t) for t in chunks[-2]):
                 pair = chunks[-2]+chunks[-1]
                 widths = weights[-len(pair):]
                 spoken = [any(c.isalnum() for c in t) for t in pair]

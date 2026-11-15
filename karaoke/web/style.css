@@ -36,6 +36,8 @@ button.is-queued{opacity:1;color:var(--muted);border-color:var(--line);backgroun
 @media(pointer:coarse){.transport button,.brand,.music-add,.find-mv,.music-title h3>button,.music-credits button,.storage-panel summary{min-height:44px}.icon-button,.preview-heading button{min-width:44px;min-height:44px}.storage-panel summary{align-items:center}}
 
 
+.paused-frame{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#050705;pointer-events:none}
+
 /* One shared panel; fullscreen exposes only the playback timeline. */
 .transport{position:fixed;z-index:5;inset:auto 0 0;border-top:1px solid var(--line);background:var(--bg);padding:12px 28px calc(12px + env(safe-area-inset-bottom))}
 .transport-layout{display:grid;grid-template-columns:minmax(160px,1fr) minmax(240px,360px) max-content;grid-template-areas:"track playback tools" "track seek tools";gap:4px 24px;align-items:center;max-width:1360px;margin:auto}

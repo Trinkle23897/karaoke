@@ -1567,7 +1567,12 @@ test('pausing cancels media transfers and retry timers; resume reuses completed 
     p.context.currentTime=p.anchor+8; frame(); await settled();
     assert.equal(pending.length,1); assert.equal(attempts,1);
     const previous=p.stream;
-    p.suspend(); await settled();
+    const draws=[], canvas={hidden:true,getContext:()=>({drawImage:(...args)=>draws.push(args)})};
+    Object.assign(p.video,{videoWidth:1280,videoHeight:720});
+    p.suspend(canvas,8); await settled();
+    assert.deepEqual(draws,[[p.video,0,0]]);
+    assert.deepEqual([canvas.width,canvas.height,canvas.hidden],[1280,720,false]);
+    p.suspend(canvas,8); assert.equal(draws.length,1);
     assert.equal(pending[0].signal.aborted,true);
     assert.equal(p.video.src,undefined); assert.equal(p.video.paused,true);
     assert.equal(p.ready,false); assert.equal(p.anchor,null);
@@ -1576,6 +1581,7 @@ test('pausing cancels media transfers and retry timers; resume reuses completed 
     assert.equal(requests.length,count); assert.equal(attempts,1);
     globalThis.fetch=streamingFetch(url=>{requests.push(url);return null;});
     await p.load({...song,duration:80},8); await settled();
+    assert.equal(canvas.hidden,true); assert.equal(p.frame,null);
     await p.apply({...state,position:8},clockOffset());
     assert.notEqual(p.stream,previous); assert.equal(p.ready,true);
     assert.equal(p.video.src,song.artifacts.mv);
@@ -1583,6 +1589,23 @@ test('pausing cancels media transfers and retry timers; resume reuses completed 
     assert.ok(requests.slice(count).every(url=>url.endsWith('/4')));
     assert.equal(p.stream.at(8),previous.at(8));
   } finally { p.clear(); globalThis.fetch=fetchAudio; }
+});
+
+test('discard a paused frame on seek or song change even when capturing fails', async () => {
+  const p=setup(), canvas={hidden:true,getContext:()=>({drawImage(){}})};
+  try {
+    await p.unlock(); await p.load(song,3);
+    Object.assign(p.video,{videoWidth:640,videoHeight:360});
+    p.suspend(canvas,3); assert.equal(canvas.hidden,false);
+    p.suspend(canvas,7); assert.equal(canvas.hidden,true); assert.equal(p.frame,null);
+    await p.load(song,7);
+    canvas.getContext=()=>{throw new Error('capture failed');};
+    p.suspend(canvas,7); assert.equal(p.video.src,undefined); assert.equal(p.abort.signal.aborted,true);
+    canvas.getContext=()=>({drawImage(){}});
+    await p.load(song,7); p.suspend(canvas,7);
+    await p.load({...song,id:'two',job_id:'two'},0);
+    assert.equal(canvas.hidden,true); assert.equal(p.frame,null);
+  } finally {p.clear();}
 });
 
 test('failed audio loading releases the native video transfer too', async () => {

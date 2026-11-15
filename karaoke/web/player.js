@@ -334,8 +334,27 @@ export class Player {
     this.video.pause();
   }
 
-  suspend() {
+  clearFrame() {
+    if (!this.frame) return;
+    this.frame.hidden = true;
+    this.frame.width = this.frame.height = 0;
+    this.frame = null;
+    this.frozenPosition = null;
+  }
+
+  suspend(frame = null, position = 0) {
     this.stop();
+    if (this.frame && (this.frame !== frame || Math.abs(this.frozenPosition - position) > .04)) this.clearFrame();
+    if (frame && !this.frame && this.video.src && this.video.readyState >= 2 && this.video.videoWidth && this.video.videoHeight) {
+      try {
+        frame.width = this.video.videoWidth;
+        frame.height = this.video.videoHeight;
+        frame.getContext('2d').drawImage(this.video, 0, 0);
+        frame.hidden = false;
+        this.frame = frame;
+        this.frozenPosition = position;
+      } catch { frame.width = frame.height = 0; }
+    }
     this.abort?.abort();
     this.ready = false;
     this.videoPrepared = null;
@@ -395,6 +414,7 @@ export class Player {
   async load(entry, position = 0) {
     const generation = this.loadGeneration = (this.loadGeneration || 0) + 1;
     const cached = this.matches(entry) ? this.stream : null;
+    if (!cached) this.clearFrame();
     if (cached && !cached.signal.aborted) {
       const stream = this.stream;
       try {
@@ -425,6 +445,7 @@ export class Player {
     this.loading = Promise.all([this.stream.prepare(position), videoReady(this.video, signal, position)]).then(() => {
       if (signal.aborted) return;
       this.ready = true;
+      this.clearFrame();
     }).catch(error => {
       if (signal.aborted) return;
       this.key = null;

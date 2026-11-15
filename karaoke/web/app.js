@@ -750,7 +750,8 @@ function updateCover() {
   $('skip-intro').toggleAttribute('hidden', startingVideo || introSkipTarget() === null);
   if (player.anchor === null || player.entry?.id !== song?.id)
     $('opening-countdown').toggleAttribute('hidden', true);
-  $('screen-cover').toggleAttribute('hidden', Boolean(song?.status === 'completed' && !loading && !startingVideo && !loadError && player.unlocked && player.ready));
+  const frozen = !state.playing && player.frame && player.matches(song);
+  $('screen-cover').toggleAttribute('hidden', Boolean(song?.status === 'completed' && !loading && !startingVideo && !loadError && player.unlocked && (player.ready || frozen)));
   const status = loadError || (!song ? state.playing ? '准备好后自动接唱' : '请先点歌' : song.status !== 'completed' ? statusText(song) : startingVideo ? '加载画面…' : loading ? '加载音轨…' : '');
   if ($('screen-status').textContent !== status) $('screen-status').textContent = status;
   $('screen-status').toggleAttribute('hidden', !status || song?.status === 'running');
@@ -817,7 +818,8 @@ player.onError = error => {
 async function syncPlayback() {
   const song = current();
   if (!tabs.owns() || !song || song.status !== 'completed' || !state.playing || !player.unlocked) {
-    if (tabs.owns() && song && player.entry?.id === song.id) player.suspend();
+    if (tabs.owns() && song && player.entry?.id === song.id)
+      player.suspend(!state.playing && song.status === 'completed' && player.matches(song) ? $('paused-frame') : null, state.position);
     else { player.clear(); loadError = ''; }
     readySent = null; loading = false;
     updateCover(); return;

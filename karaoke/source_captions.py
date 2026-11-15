@@ -5,6 +5,7 @@ import json
 import math
 import re
 import time
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -74,16 +75,13 @@ def fetch_manual_captions(metadata_path, language, cache):
     return path
 
 
-def caption_candidate(packet, transcription, language, duration):
-    """Check source text against audio; caption display times are never word times."""
-    from rapidfuzz.distance import Levenshtein
-
-    from .song_sources import transcript_lines
+def caption_events(packet, language, duration):
+    """Read source display events; their timestamps are not acoustic onsets."""
     if packet.get('error'):
         return None, dict(status='unavailable', error=packet['error'], retry_at=packet.get('retry_at'))
     if song_language(packet.get('language')) != language:
         return None, dict(status='wrong_caption_language')
-    texts = []
+    events = []
     try:
         for event in packet['response']['events']:
             text = ''.join(s.get('utf8', '') for s in event.get('segs', []))
@@ -99,10 +97,24 @@ def caption_candidate(packet, transcription, language, duration):
                 # sing those labels or guess which bracketed words to delete;
                 # retain the audio transcript instead of this optional source.
                 return None, dict(status='unsupported_caption_annotations')
-            texts.append(dict(text=text))
+            events.append(dict(text=text, start=start, end=end))
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        return None, dict(status='invalid_caption_document')
+    return events, None
+
+
+def caption_candidate(packet, transcription, language, duration):
+    """Check source text against audio; caption display times are never word times."""
+    from rapidfuzz.distance import Levenshtein
+
+    from .song_sources import transcript_lines
+    events, error = caption_events(packet, language, duration)
+    if events is None:
+        return None, error
+    try:
         # Caption display events can contain only musical notes or punctuation.
         # Wrap the complete text so those symbols join an adjacent lyric line.
-        lines = transcript_lines(dict(segments=texts), language)
+        lines = transcript_lines(dict(segments=events), language)
         if not lines or len(lines) > 1000 or any(len(line) > 200 for line in lines):
             raise ValueError('Invalid lyric length')
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
@@ -117,3 +129,79 @@ def caption_candidate(packet, transcription, language, duration):
         video_id=packet['video_id'], response_sha256=hashlib.sha256(
             json.dumps(packet['response'], sort_keys=True).encode()).hexdigest())
     return lines if accepted else None, report
+
+
+def prepare_caption_lyrics(request, metadata, duration, cache, model):
+    """Use manual same-recording text only after every omission is confirmed as speech."""
+    from .lyric_lookup import text_language
+    from .song_sources import SongText, extract_song_metadata, transcript_lines, video_song_info
+    from .vocal_review import review_gaps, speech_intervals
+
+    song = video_song_info(metadata)
+    language = request.get('language') or song.get('language')
+    if request.get('lyrics') or not language or not manual_track(metadata, language):
+        return None
+    path = fetch_manual_captions(cache.root/'download/source.info.json', language, cache)
+    if path is None:
+        return None
+    packet = json.loads(path.read_text())
+    if packet.get('video_id') != metadata.get('id'):
+        return None
+    events, error = caption_events(packet, language, duration)
+    report_path = cache.root/'caption-lyrics-review.json'
+
+    def reject(status, **details):
+        report_path.write_text(json.dumps(dict(status=status, **details), ensure_ascii=False)+'\n')
+        return None
+
+    if events is None:
+        return reject(**error)
+    if not events or len(events) > 1000 or sum(len(e['text']) for e in events) > 50000:
+        return reject('invalid_caption_document')
+    evidence = {key:metadata.get(key) for key in ('title','track','artist','artists','uploader')}
+    evidence['caption_lines'] = [dict(number=i+1, text=e['text']) for i,e in enumerate(events)]
+    selection = cache.root/'caption-selection.json'
+    with cache.stage('select_caption_lyrics', inputs=[path], outputs=[selection],
+                     config=dict(evidence=evidence, model=model),
+                     code=[Path(__file__), Path(__file__).with_name('song_sources.py')]) as reused:
+        if not reused:
+            selection.write_text(json.dumps(extract_song_metadata(evidence, model), ensure_ascii=False)+'\n')
+    result = json.loads(selection.read_text()).get('parsed')
+    if result is None:
+        return reject('invalid_selection')
+    parsed = SongText.model_validate(result)
+    chosen = parsed.lyric_line_numbers
+    if not chosen or chosen != sorted(set(chosen)) or any(not 1 <= i <= len(events) for i in chosen):
+        return reject('invalid_selection')
+    selected, omitted, groups = set(chosen), [], []
+    for number, event in enumerate(events, 1):
+        if number not in selected:
+            omitted.append(event)
+        elif omitted:
+            groups.append(omitted)
+            omitted = []
+    if omitted:
+        groups.append(omitted)
+    ranges = [dict(start=min(e['start'] for e in g), end=max(e['end'] for e in g)) for g in groups]
+    picked = [events[i-1] for i in chosen]
+    if len(ranges) > 8 or any(r['end'] > duration or r['end']-r['start'] > 90 or
+            any(e['start'] < r['end'] and r['start'] < e['end'] for e in picked) for r in ranges):
+        return reject('unreviewable_omission', omitted_ranges=ranges)
+    reviews = review_gaps(cache.root, ranges, [e for g in groups for e in g]) if ranges else []
+    accepted = speech_intervals(cache.root, reviews)
+    report = dict(status='accepted' if accepted == [(r['start'],r['end']) for r in ranges] else 'unverified_omission',
+        video_id=packet['video_id'], language=language, lyric_line_numbers=chosen, omitted_ranges=ranges,
+        response_sha256=hashlib.sha256(json.dumps(packet['response'], sort_keys=True).encode()).hexdigest(),
+        provider_timestamps_used_for_alignment=False)
+    report_path.write_text(json.dumps(dict(report, reviews=reviews), ensure_ascii=False)+'\n')
+    if report['status'] != 'accepted':
+        return None
+    lines = transcript_lines(dict(segments=picked), language)
+    detected = text_language(''.join(lines))
+    if (not lines or len(lines) > 1000 or any(len(line) > 200 for line in lines) or
+            detected != language and not (language == 'Cantonese' and detected == 'Chinese')):
+        return reject('invalid_lyric_text', selection=report)
+    return dict(song, id='song', title=request.get('title') or metadata.get('track') or parsed.title or song['title'],
+        artist=request.get('artist') or song['artist'] or parsed.artist, language=language, lines=lines,
+        source_url=request['url'], provenance=dict(kind='source_manual_subtitles', route='lyrics_first',
+            needs_review=True, independent_asr_coverage=None, source_captions=report))

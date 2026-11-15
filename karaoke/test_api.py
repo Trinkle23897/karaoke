@@ -1202,6 +1202,58 @@ def test_manual_caption_failure_obeys_backoff_and_keeps_cached_diagnostics(tmp_p
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize('verdict', ['speech', 'singing', 'uncertain', 'invalid_selection', 'overlap', 'automatic'])
+def test_playback_caption_lyrics_keep_all_singing_and_review_omitted_dialogue(tmp_path, monkeypatch, verdict):
+    import soundfile as sf
+
+    from karaoke import song_sources, source_captions
+    from karaoke.stage_cache import StageCache
+    from karaoke.vocal_review import SOURCES
+
+    url = 'https://www.youtube.com/api/timedtext?v=n5sjpCQhTDk&lang=ja&fmt=json3'
+    tracks = {'ja':[dict(ext='json3', url=url)]}
+    metadata = dict(id='n5sjpCQhTDk', title='番組', language='ja',
+                    **{('automatic_captions' if verdict == 'automatic' else 'subtitles'):tracks})
+    info = tmp_path/'download/source.info.json'
+    info.parent.mkdir()
+    info.write_text(json.dumps(metadata))
+    texts = ['今夜は二人に歌っていただきます', '風に吹かれて歌う', '星を見上げて歌う']
+    document = dict(events=[dict(tStartMs=i*2000, dDurationMs=2500 if i == 0 and verdict == 'overlap' else 2000,
+                     segs=[dict(utf8=text)]) for i,text in enumerate(texts)])
+    monkeypatch.setattr(source_captions, 'read_document', lambda _:document)
+    calls = []
+    def extract(evidence, model):
+        calls.append(evidence)
+        return dict(parsed=dict(title='風の歌', artist='二人',
+                    lyric_line_numbers=[3,2] if verdict == 'invalid_selection' else [2,3]))
+    monkeypatch.setattr(song_sources, 'extract_song_metadata', extract)
+    for name in SOURCES:
+        path = tmp_path/name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(path, np.full(6*16000,.1), 16000)
+    response = vocal_review_response(singing=verdict == 'singing', uncertain=verdict == 'uncertain')
+    with patch('openai.OpenAI') as client:
+        client.return_value.chat.completions.create.side_effect = [
+            SimpleNamespace(model_dump=lambda **k:vocal_review_response()),
+            SimpleNamespace(model_dump=lambda **k:response)]
+        result = source_captions.prepare_caption_lyrics(dict(url=URL), metadata, 6., StageCache(tmp_path), 'test')
+        assert client.return_value.chat.completions.create.call_count == (2 if verdict in ('speech','singing','uncertain') else 0)
+    if verdict == 'speech':
+        assert result['lines'] == texts[1:]
+        assert result['title'] == '風の歌' and result['language'] == 'Japanese'
+        assert result['provenance']['source_captions']['omitted_ranges'] == [dict(start=0.,end=2.)]
+        assert not result['provenance']['source_captions']['provider_timestamps_used_for_alignment']
+        with patch('openai.OpenAI') as client:
+            assert source_captions.prepare_caption_lyrics(dict(url=URL), metadata, 6., StageCache(tmp_path), 'test') == result
+            client.assert_not_called()
+        assert len(calls) == 1
+    else:
+        assert result is None
+        if verdict != 'automatic':
+            report = json.loads((tmp_path/'caption-lyrics-review.json').read_text())
+            assert report['status'] == {'invalid_selection':'invalid_selection','overlap':'unreviewable_omission'}.get(verdict,'unverified_omission')
+
+
 @pytest.mark.parametrize('padded', [False, True])
 @pytest.mark.parametrize('soundtrack_credit', [False, True])
 @pytest.mark.parametrize('performance', [None, 'same', 'different', 'unspecified'])

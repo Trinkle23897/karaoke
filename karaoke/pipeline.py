@@ -1294,6 +1294,15 @@ class Pipeline:
                     raise
                 text_error = error
                 lyrics = None
+                if isinstance(error, StageFailure) and error.stage == 'prepare_lyrics' and not local_asr.offline():
+                    from .source_captions import prepare_caption_lyrics
+                    lyrics = prepare_caption_lyrics(self.request, metadata, duration, self.checkpoints, self.text_model)
+                    if lyrics is not None:
+                        write_json(self.output/'lyrics.json', lyrics)
+                        write_json(self.output/'anchors.json', [])
+                        self.alignment_outputs.add(self.output/'anchors.json')
+                        self.phase(song_info={key:lyrics[key] for key in ('title','artist','language')})
+                        text_error = None
             if text_error is None:
                 lyrics = self.resolve_lyric_language(lyrics)
                 lyrics, text_error = self.align_candidates(lyrics, metadata, duration, packaging)

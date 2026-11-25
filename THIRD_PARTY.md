@@ -6,7 +6,7 @@
 
 | 内容 | 来源与版本 | 许可与本地修改 |
 | --- | --- | --- |
-| `karaoke/web/vendor/signalsmith-stretch.mjs` | [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch/tree/a670068d9aeb64913331d5cc29337b19a457a7df)，Geraint Luff / Signalsmith Audio Ltd. | [MIT 全文](karaoke/web/vendor/signalsmith-stretch.LICENSE.txt)。停用时跳过 WASM DSP，由原生延迟通道处理原调播放；修复声道数变化时的重新配置调用，并删除不可达的旧停用分支。原版和本地哈希见 [pitch-shift.json](karaoke/dependencies/pitch-shift.json)。 |
+| `karaoke/web/vendor/signalsmith-stretch.mjs` | [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch/tree/a670068d9aeb64913331d5cc29337b19a457a7df)，Geraint Luff / Signalsmith Audio Ltd. | [MIT 全文](karaoke/web/vendor/signalsmith-stretch.LICENSE.txt)。本地修改让原调跳过变调运算，修复声道数变化时的重新配置，并提供直接加载内嵌 WASM 的入口，供没有 AudioWorklet 的浏览器使用。原版和本地哈希见 [pitch-shift.json](karaoke/dependencies/pitch-shift.json)。 |
 | `karaoke/benchmark_mimo.py` 的分块与交叉淡化实现 | [Sony MIMO 的 evaluate.py](https://github.com/SonyResearch/mimo-audio-separation/blob/9169bbbf9e6fdca5b22d5735b4244fbad7ab40b5/src/evaluate.py)，Yukara Ikemiya | 改编用于本项目的离线评测；保留 [MIT 全文](licenses/mimo-MIT.txt)。模型与上游源码不随仓库提供。 |
 | `karaoke/models/pretrained/vocals_mel_band_roformer*.yaml` | [KimberleyJSN / Mel-Band RoFormer](https://huggingface.co/KimberleyJSN/melbandroformer) | 上游模型卡声明 MIT。保留上游配置及本项目的推理配置；权重哈希见 [separation.json](karaoke/dependencies/separation.json)。 |
 | `karaoke/models/pretrained/karaoke_bs_roformer_anvuew.yaml` | [Anvuew 的固定版本](https://huggingface.co/anvuew/karaoke_bs_roformer/tree/0d4423d42e12cf2ba39ae09171028507b8a2a7be) | 该版本模型卡声明 `gpl-3.0`，保留 [GPL v3 全文](licenses/GPL-3.0.txt)。 |

@@ -445,6 +445,7 @@ SignalsmithStretch = ((Module, audioNodeKey) => {
 			}
 		});
 	};
+	createNode.createModule = Module;
 	return createNode;
 })(SignalsmithStretch, "signalsmith-stretch");
 // register as a CommonJS/AMD module

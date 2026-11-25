@@ -1524,6 +1524,12 @@ test('audio downloads stay near playback and fetched audio is reused on rewind',
     assert.ok(next.every(s=>Math.abs(s.started[1]-256/48000)<1e-9));
     p.context.currentTime=p.audibleWhen; frame();
     for (let position=1;position<79;position++) {
+      if (position===8) {
+        // A live mix update's UI clock can cross the boundary first.
+        p.context.currentTime=p.anchor+7.95;
+        await p.load({...song,duration:80},8.1);
+        assert.ok(p.hasAudio(7.95));
+      }
       p.context.currentTime=p.anchor+position;
       for (const source of [...p.sources]) {
         if (source.started[0]+source.length<=p.context.currentTime) source.onended();

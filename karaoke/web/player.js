@@ -197,6 +197,8 @@ export class Player {
       // direct seek/resume callers before scheduling any audio.
       await this.prepareVideo(pending.position, pending.abort.signal);
       if (this.pendingStart !== pending) return;
+      if (this.pitchChain?.prepare) await this.pitchChain.prepare(this.stream, pending.position, this.levels);
+      if (this.pendingStart !== pending) return;
       if (this.context.state !== 'running') throw new Error('声音尚未启动，请点播放重试');
       this.pendingStart = null;
       this.videoRun = pending;
@@ -207,7 +209,7 @@ export class Player {
       this.lastVideoTime = this.video.currentTime;
       this.lastVideoAdvance = this.context.currentTime;
       this.pump();
-      this.pitchChain?.start(this.audibleWhen);
+      this.pitchChain?.start?.(this.audibleWhen);
       this.tick();
     } catch (error) {
       if (this.pendingStart !== pending) return;
@@ -275,6 +277,7 @@ export class Player {
   preparePitch() {
     if (!this.pitchLoading) {
       this.pitchLoading = this.pitchFactory(this.context, this.master).then(chain => {
+        if (this.disposed) { chain.dispose?.(); return; }
         this.pitchChain = chain;
         for (const gain of this.gains) { gain.disconnect(); gain.connect(chain.input); }
         chain.setPitch(this.pitch);
@@ -377,6 +380,7 @@ export class Player {
   dispose() {
     this.disposed = true;
     this.clear();
+    this.pitchChain?.dispose?.();
     this.context?.close();
   }
 
@@ -419,6 +423,9 @@ export class Player {
       const stream = this.stream;
       try {
         await this.loading;
+        // During playback pump() advances the decoded window on the audio
+        // clock. A mix update's wall-clock position can be a window ahead.
+        if (this.anchor !== null && stream.at(position)) return;
         if (!stream.signal.aborted) await Promise.all([stream.prepare(position),
           this.anchor === null ? videoReady(this.video, stream.signal, position) : Promise.resolve()]);
       } catch (error) {
@@ -521,11 +528,16 @@ export class Player {
       }
       this.scheduledUntil = end;
     }
-    if (position >= this.scheduledUntil && this.scheduledUntil < stream.duration) {
-      const pausedAt = this.scheduledUntil, startedAt = this.startedAt;
-      this.stop();
-      this.onTick(pausedAt);
-      this.onBuffering?.(pausedAt, startedAt);
+    const mix = this.pitchChain?.pump?.(stream, this.anchor, this.startPosition, this.scheduledUntil, this.levels);
+    if (mix?.pending) {
+      const run = this.videoRun;
+      mix.pending.then(
+        () => { if (this.videoRun === run) this.pump(); },
+        error => { if (this.videoRun === run) this.failPlayback(error, position); },
+      );
     }
+    if (mix?.missing != null) this.waitForMedia(mix.missing);
+    else if (position >= this.scheduledUntil && this.scheduledUntil < stream.duration)
+      this.waitForMedia(this.scheduledUntil);
   }
 }

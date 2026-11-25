@@ -4,14 +4,15 @@
   "commit": "a670068d9aeb64913331d5cc29337b19a457a7df",
   "source": "web/release/SignalsmithStretch.mjs",
   "vendored_file": "web/vendor/signalsmith-stretch.mjs",
-  "sha256": "4070f54352cf32fe472774f7d531908be48d5ee31c56806202f78e034c592402",
+  "sha256": "878e077a01216b9f706fa0231b022ec4d24a3a1c3e22322267602b3ed8ee67f8",
   "license": "MIT",
   "license_file": "web/vendor/signalsmith-stretch.LICENSE.txt",
-  "purpose": "Local real-time pitch shifting in AudioWorklet; embedded WASM, no runtime CDN dependency",
+  "purpose": "Local real-time pitch shifting with embedded WASM, with or without AudioWorklet",
   "upstream_sha256": "97530b11d5bc01015af4cde40d6aa55ff10c40aa1294ca4c8c5762027d517a46",
   "local_changes": [
     "Inactive processing returns silence before WASM DSP; native dry delay handles original-pitch playback.",
     "Reconfigure through the processor instance when the output channel count changes.",
-    "Remove the inactive DSP branch made unreachable by the earlier return."
+    "Remove the inactive DSP branch made unreachable by the earlier return.",
+    "Expose the embedded WASM factory as createModule for buffered playback without AudioWorklet."
   ]
 }

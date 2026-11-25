@@ -48,6 +48,6 @@ gitleaks git . --log-opts=--all --redact=100
 
 ## 部署与许可
 
-服务使用共享歌单，默认监听本机。远程访问的 HTTPS 和整站访问控制配置见 [SETUP](SETUP.md#5-运行配置)。
+服务默认支持局域网访问，所有设备共享歌单。本机监听和公网访问控制的配置见 [SETUP](SETUP.md#5-运行配置)。
 
 项目自行编写的代码与文档采用 [MIT License](LICENSE)。贡献内容应可按项目许可提供；新增依赖、引入的代码和模型配置保留原许可、出处及署名，并更新 [THIRD_PARTY.md](THIRD_PARTY.md)。

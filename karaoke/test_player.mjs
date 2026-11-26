@@ -1,6 +1,6 @@
 import test, {beforeEach} from 'node:test';
 import assert from 'node:assert/strict';
-import {Player} from './web/player.js';
+import {Player, bindSeek, bindSongButton} from './web/player.js';
 import {isStaleRoomSnapshot, applyRoomPatch, LocalPlayback, PlaybackTabs, RoomEvents, queueToTop, queueTopCandidates, preparationRetry} from './web/room-state.js';
 
 test('room subscriptions recover closed and silent connections without polling or accepting old events', t => {
@@ -250,6 +250,68 @@ test('skipping a waiting entry stays local after reload; an explicit removal is 
   assert.equal(local.entry.id,'one');
 });
 
+test('the last skipped song can be restored after it becomes ready, pause and reload', () => {
+  const entries = [{id:'first',job_id:'one',status:'queued'}];
+  let local = new LocalPlayback();
+  local.reconcile({entries});
+  local.command('play',{},entries);
+  // Preparation can complete while the skip gesture is activating audio.
+  entries[0].status = 'completed';
+  local.command('next',{entry_id:'first',waiting:true},entries);
+  assert.equal(local.reconcile({entries}).current_id,null);
+  assert.equal(local.allSkipped,true);
+  local.command('pause',{},entries);
+  local = new LocalPlayback(local.save());
+  local.reconcile({entries});
+  assert.equal(local.allSkipped,true);
+  local.command('play',{},entries);
+  assert.equal(local.reconcile({entries}).current_id,'first');
+  assert.equal(local.allSkipped,false);
+  assert.equal(local.state.playing,true);
+  assert.deepEqual(local.pendingFinishes,[]);
+});
+
+test('a double tap or a held next button cannot skip a second song', () => {
+  const entries = ['a','b','c'].map(id => ({id,job_id:id,status:'completed'}));
+  const local = new LocalPlayback();
+  local.reconcile({entries});
+  const button = {disabled:false};
+  const advance = song => local.command('next',{entry_id:song.id},entries);
+  bindSongButton(button, () => local.entry, advance);
+  for (const timeStamp of [100,250]) {
+    button.onpointerdown();
+    button.onclick({detail:1,timeStamp});
+  }
+  assert.equal(local.entry.id,'b');
+  button.onpointerdown();
+  advance(local.entry); // Natural end during the press.
+  button.onclick({detail:1,timeStamp:3000});
+  assert.equal(local.entry.id,'c');
+  button.onclick({detail:0}); // A fresh keyboard activation.
+  assert.equal(local.entry,null);
+});
+
+test('releasing a progress drag after the song ends cannot seek the next entry for the same recording', () => {
+  const entries = ['one','two'].map(id => ({id,job_id:'same',duration:150,status:'completed'}));
+  const local = new LocalPlayback();
+  local.reconcile({entries});
+  const slider = {value:'148'};
+  const dragging = bindSeek(slider, () => local.entry.id,
+    () => { if (!dragging()) slider.value = String(local.position()); },
+    (position,entry_id) => local.command('seek',{position,entry_id},entries));
+  slider.onpointerdown();
+  slider.value = '75'; slider.oninput();
+  local.command('next',{entry_id:'one'},entries);
+  assert.equal(local.reconcile({entries}).current_id,'two');
+  slider.oninput(); slider.onchange();
+  assert.equal(local.position(),0);
+  assert.equal(slider.value,'0');
+  slider.value = '12'; slider.oninput(); slider.onchange(); // Keyboard seek on the new song.
+  assert.equal(local.position(),12);
+  slider.onpointerdown(); slider.value = '36'; slider.oninput(); slider.onpointercancel();
+  assert.equal(slider.value,'12');
+});
+
 let frame;
 class Context extends EventTarget {
   sampleRate = 48000;
@@ -286,6 +348,7 @@ function setup(onEnd=()=>{}) {
   return p;
 }
 const clockOffset = () => 100-Date.now()/1000;
+const output = (local, position) => local.observe(local.entry.id, local.state.started_at, position);
 test('media maintenance sleeps while idle and preserves a precise start without per-frame work', async t => {
   t.mock.timers.enable({apis:['setTimeout', 'Date'], now:100000});
   const p=setup(), ticks=[], ended=[];
@@ -383,6 +446,8 @@ test('two devices play, pause, seek and mix independently across shared queue up
     assert.equal(phone.entry.id,'two'); assert.equal(phone.state.started_at,null);
     assert.equal(computer.entry.id,'one');
     room.entries[1].status='completed'; snapshot(phone); command(phone,'ready');
+    assert.equal(phone.state.playing,false); assert.equal(phone.state.started_at,null);
+    command(phone,'play'); command(phone,'ready');
     assert.notEqual(phone.state.started_at,null);
   } finally { desktop.clear(); mobile.clear(); }
 });
@@ -395,6 +460,7 @@ test('finishing on one device does not interrupt the other or resurrect a remove
     device.reconcile(room); device.command('play',{},room.entries); device.command('ready',{},room.entries);
   }
   now+=5;
+  output(computer,5); output(phone,5);
   const {finished}=phone.command('next',{entry_id:'one'},room.entries);
   assert.deepEqual(finished,{action:'finish',entry_id:'one',playback_started_at:100});
   room.entries.shift();
@@ -409,6 +475,63 @@ test('finishing on one device does not interrupt the other or resurrect a remove
   assert.equal(phone.entry,null);
   room.entries.push({...song,id:'three'}); phone.reconcile(room);
   assert.equal(phone.entry.id,'three'); assert.equal(phone.state.playing,true);
+});
+
+test('a removed performance survives seek and buffering until it is paused or the page reloads', () => {
+  const original = {...song,status:'completed'}, head = {...original,id:'two',job_id:'two'};
+  const local = new LocalPlayback();
+  local.select(original,true);
+  local.command('pitch',{pitch_semitones:3},[original,head]);
+  local.command('ready',{},[original,head]); output(local,2);
+  const room = {entries:[head],playback_entry:original};
+  local.reconcile(room);
+  local.command('seek',{entry_id:original.id,position:9},room.entries);
+  assert.equal(local.reconcile(room).current_id,original.id);
+  local.command('ready',{},room.entries); output(local,10);
+  local.command('buffering',{playback_started_at:local.state.started_at,position:10},room.entries);
+  assert.equal(local.reconcile(room).current_id,original.id);
+  assert.equal(local.position(),10); assert.equal(local.state.pitch_semitones,3);
+  const restored = new LocalPlayback(local.save());
+  local.command('pause',{},room.entries);
+  for (const tab of [local,restored]) {
+    assert.equal(tab.reconcile(room).current_id,head.id);
+    tab.reconcile(room);
+    assert.equal(tab.pendingFinishes.length,1);
+    assert.equal(tab.pendingFinishes[0].entry_id,original.id);
+    assert.ok(tab.pendingFinishes[0].playback_started_at);
+  }
+});
+
+test('only output past the requested sample counts as singing or advances the saved position', async t => {
+  let now = 100; t.mock.method(Date,'now',()=>now*1000);
+  const entries = ['one','two'].map(id=>({...song,id,status:'completed'}));
+  const local = new LocalPlayback(), p = setup();
+  p.onTick = position => local.observe(p.entry.id,p.startedAt,position);
+  try {
+    local.select(entries[0],true);
+    await p.unlock();
+    p.context.outputLatency = .24;
+    for (const entry of entries) {
+      local.command('seek',{position:5},entries);
+      await p.load(entry,5);
+      local.command('ready',{},entries);
+      now += 2;
+      await p.apply(local.reconcile({entries}),0);
+      p.context.currentTime = p.audibleWhen;
+      p.tick();
+      assert.equal(local.save().position,5); assert.equal(local.save().played_at,null);
+      if (entry.id === 'one') {
+        assert.equal(local.command('next',{},entries).finished.playback_started_at,null);
+      } else {
+        now += 10;
+        p.context.currentTime += .24 + .125;
+        output(local,p.position());
+        local.command('pause',{},entries);
+        assert.ok(Math.abs(local.position()-5.125)<1e-9);
+        assert.ok(Math.abs(local.playedAt-(now-.125))<1e-9);
+      }
+    }
+  } finally {p.dispose();}
 });
 
 test('queue to top inserts after the playing song without changing either device transport', () => {
@@ -449,6 +572,7 @@ test('only idle preselection follows queue order; pause, refresh and seek preser
   singing.command('play',{},entries); singing.command('ready',{},entries);
   singing.command('pitch',{pitch_semitones:2},entries);
   now+=12;
+  output(singing,12);
   const before = singing.save();
   const reordered = queueToTop(entries,'three').map(id => entries.find(e => e.id === id));
   idle.reconcile({entries:reordered}); singing.reconcile({entries:reordered});
@@ -465,8 +589,18 @@ test('only idle preselection follows queue order; pause, refresh and seek preser
     assert.equal(paused.position(),12);
   }
   const seeked = new LocalPlayback(); seeked.reconcile({entries});
+  seeked.command('pitch',{pitch_semitones:3},entries);
   seeked.command('seek',{position:8},entries); seeked.reconcile({entries:reordered});
   assert.equal(seeked.entry.id,'one'); assert.equal(seeked.position(),8);
+  for (const action of ['restart','seek']) {
+    const selected = new LocalPlayback(seeked.save());
+    selected.command(action,{position:0},reordered);
+    for (const browser of [selected,new LocalPlayback(selected.save())]) {
+      browser.reconcile({entries:reordered});
+      assert.equal(browser.entry.id,'one'); assert.equal(browser.position(),0);
+      assert.equal(browser.state.pitch_semitones,3); assert.equal(browser.playedAt,null);
+    }
+  }
   idle.command('play',{},reordered); idle.command('ready',{},reordered);
   assert.equal(idle.entry.id,'three');
   idle.command('next',{},reordered); idle.reconcile({entries:reordered});
@@ -475,14 +609,17 @@ test('only idle preselection follows queue order; pause, refresh and seek preser
 
 test('a ready song behind a preparing head retains its place when paused and resumed', t => {
   let now=100; t.mock.method(Date,'now',()=>now*1000);
-  const entries=[{...song,status:'queued'},{...song,id:'ready',status:'completed'}];
+  const entries=[{...song,status:'queued'},{...song,id:'ready',status:'completed',duration:60}];
   const local=new LocalPlayback(); local.reconcile({entries});
   local.command('play',{},entries); local.reconcile({entries}); local.command('ready',{},entries);
-  now+=30;
+  local.command('pause',{},entries); local.reconcile({entries});
+  assert.equal(local.entry.id,'ready'); assert.equal(local.playedAt,null);
+  local.command('play',{},entries); local.command('ready',{},entries);
+  now+=30; output(local,30);
   local.command('pause',{},entries); local.reconcile({entries});
   assert.equal(local.entry.id,'ready'); assert.equal(local.position(),30);
   local.command('play',{},entries); local.reconcile({entries}); local.command('ready',{},entries);
-  now+=2;
+  now+=2; output(local,32);
   assert.equal(local.entry.id,'ready'); assert.equal(local.position(),32);
 });
 
@@ -491,7 +628,7 @@ test('failed finishes survive reload, retry idempotently and do not repeat or sk
   const entries=['one','two','three'].map(id=>({...song,id,status:'completed'}));
   const room={entries:[...entries],history:[]};
   let local=new LocalPlayback(); local.reconcile(room);
-  local.command('play',{},entries); local.command('ready',{},entries); now+=5;
+  local.command('play',{},entries); local.command('ready',{},entries); now+=5; output(local,5);
   local.command('next',{entry_id:'one'},entries,60);
   const finish={action:'finish',entry_id:'one',playback_started_at:160};
   await assert.rejects(local.flushFinishes(async body=>{
@@ -507,7 +644,7 @@ test('failed finishes survive reload, retry idempotently and do not repeat or sk
   await assert.rejects(local.flushFinishes(async body=>{
     await send(body); throw new Error('response lost');
   },()=>assert.fail('lost response')));
-  local.command('ready',{},room.entries); now+=5;
+  local.command('ready',{},room.entries); now+=5; output(local,5);
   local.command('next',{entry_id:'two'},room.entries,60);
   assert.equal(local.pendingFinishes.length,2);
   const sent=[];
@@ -575,9 +712,11 @@ test('browser refresh restores only its own playback intent, with no clock befor
   let now=100; t.mock.method(Date,'now',()=>now*1000);
   const room={entries:[{...song,status:'completed'},{...song,id:'two',status:'completed'}]};
   const computer=new LocalPlayback(); computer.reconcile(room);
-  computer.command('next',{entry_id:'one'},room.entries); computer.command('ready',{},room.entries);
+  computer.command('next',{entry_id:'one'},room.entries);
+  assert.equal(computer.state.playing,false);
+  computer.command('play',{},room.entries); computer.command('ready',{},room.entries);
   computer.command('lead',{level:1},room.entries); computer.command('pitch',{pitch_semitones:2},room.entries);
-  now+=7;
+  now+=7; output(computer,7);
   const restored=new LocalPlayback(JSON.parse(JSON.stringify(computer.save())));
   restored.reconcile({...room,playing:true,position:99,current_id:'one'});
   assert.equal(restored.entry.id,'two'); assert.equal(restored.position(),7);
@@ -808,11 +947,12 @@ test('local readiness, count-in and stale buffering never start or rewind the wr
   const p=new LocalPlayback(); p.reconcile(room); p.command('play',{},room.entries);
   now+=2; assert.equal(p.position(),0); assert.equal(p.state.started_at,null);
   p.command('ready',{},room.entries); assert.equal(p.state.started_at,105);
-  now=104; assert.equal(p.position(),0);
-  now=109; assert.equal(p.position(),4);
+  now=104; output(p,-1); assert.equal(p.position(),0); assert.equal(p.playedAt,null);
+  now=109; output(p,4); assert.equal(p.position(),4);
   p.command('buffering',{entry_id:'one',position:3.5,playback_started_at:105},room.entries);
   now=112; assert.equal(p.position(),3.5); assert.equal(p.state.started_at,null);
   p.command('ready',{},room.entries); assert.equal(p.state.started_at,112);
+  p.observe('one',105,12); p.observe('another',112,10);
   p.command('buffering',{entry_id:'one',position:1,playback_started_at:105},room.entries);
   assert.equal(p.state.started_at,112); assert.equal(p.position(),3.5);
 });
@@ -1092,9 +1232,10 @@ test('stems begin together; mode and volume changes do not restart or seek', asy
   assert.deepEqual(p.gains.map(g=>g.gain.value),[.8,0,.2]);
   await p.apply({...state,levels:{instrumental:0,backing_vocals:0,lead_vocals:0}},clockOffset());
   assert.ok(p.gains.every(g=>g.gain.value===0));assert.deepEqual(p.sources,originalSources);
+  // A late ready callback must still start on the requested sample.
   await p.apply({...state,started_at:98},clockOffset());
-  assert.equal(p.video.currentTime,5);
-  assert.ok(p.sources.every(s=>s.started[1]===5));
+  assert.equal(p.video.currentTime,3);
+  assert.ok(p.sources.every(s=>s.started[1]===3));
   p.clear();
 });
 

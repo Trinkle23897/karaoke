@@ -2,6 +2,50 @@
 import {createPitchShift} from './pitch-shift.js';
 import {StemStream} from './stem-stream.js';
 
+export function bindSongButton(button, current, act) {
+  let pressed, lastTap = -Infinity;
+  button.onpointerdown = () => { pressed = current(); };
+  button.onkeydown = event => { if (event.repeat && event.key === 'Enter') event.preventDefault(); };
+  button.onclick = event => {
+    const song = current();
+    const target = event.detail && pressed ? pressed : song;
+    pressed = null;
+    if (button.disabled || !target || target.id !== song?.id) return;
+    if (event.detail) {
+      // Touch browsers can report two taps as separate single clicks.
+      const repeated = event.detail > 1 || event.timeStamp - lastTap < 350;
+      lastTap = event.timeStamp;
+      if (repeated) return;
+    }
+    act(target);
+  };
+}
+
+// The slider can outlive a song. Commit only to the entry the user grabbed.
+export function bindSeek(input, currentId, refresh, commit) {
+  let gesture;
+  const dragging = () => Boolean(gesture && gesture.id === currentId());
+  const cancel = () => { gesture = null; refresh(); };
+  input.onpointerdown = () => { gesture = {id:currentId()}; };
+  input.oninput = () => {
+    gesture ??= {id:currentId()}; // Keyboard and assistive input.
+    refresh();
+  };
+  input.onchange = () => {
+    if (!dragging()) return cancel();
+    const {id} = gesture;
+    gesture = null;
+    commit(Number(input.value), id);
+  };
+  input.onpointercancel = input.onblur = cancel;
+  input.onpointerup = () => {
+    // Tapping the existing position may release the thumb without a change.
+    const released = gesture;
+    setTimeout(() => { if (released && released === gesture) cancel(); }, 0);
+  };
+  return dragging;
+}
+
 function videoReady(video, signal, position) {
   return new Promise((resolve, reject) => {
     const events = ['loadedmetadata', 'loadeddata', 'canplay', 'seeked'];
@@ -58,15 +102,12 @@ export class Player {
     this.tickTimer = null;
     if (this.disposed || this.anchor === null || this.context.state !== 'running') return;
     if (this.pendingStart) {
-      const pending = this.pendingStart;
-      this.onTick(pending.position === 0 ? Math.min(0, this.outputTime() - this.anchor) : pending.position);
+      this.onTick(this.position());
     } else {
       this.pump();
       if (this.anchor === null) return;
       const outputTime = this.outputTime();
-      const elapsed = outputTime - this.anchor;
-      const position = Math.min(this.scheduledUntil,
-        this.startPosition === 0 ? elapsed : Math.max(this.startPosition, elapsed));
+      const position = this.position(outputTime);
       if (this.videoPending && outputTime >= this.audibleWhen) {
         this.videoPending = false;
         this.lastVideoTime = this.video.currentTime;
@@ -78,6 +119,7 @@ export class Player {
       }
       if (position >= this.entry.duration - 0.025) {
         const id = this.entry.id;
+        this.onTick(position);
         this.stop();
         this.onEnd(id);
       } else {
@@ -98,6 +140,14 @@ export class Player {
     // which would leave the video waiting forever while audio keeps playing.
     const context = this.context;
     return Math.max(0, context.currentTime - (context.baseLatency || 0) - (context.outputLatency || 0));
+  }
+
+  position(outputTime) {
+    if (this.anchor === null) return null;
+    const elapsed = (outputTime ?? this.outputTime()) - this.anchor;
+    // Negative time displays the opening count-in. A seek/resume stays at
+    // the requested position until the first scheduled sample reaches output.
+    return Math.min(this.scheduledUntil, this.startPosition === 0 ? elapsed : Math.max(this.startPosition, elapsed));
   }
 
   syncVideo(position) {
@@ -148,6 +198,7 @@ export class Player {
 
   waitForMedia(position) {
     const startedAt = this.startedAt;
+    position = Math.max(0, Math.min(position, this.position() ?? position));
     this.stop();
     this.onTick(position);
     this.onBuffering?.(position, startedAt);
@@ -222,7 +273,7 @@ export class Player {
     this.context = new (window.AudioContext || window.webkitAudioContext)();
     this.context.onstatechange = () => {
       if (this.context.state !== 'running' && this.anchor !== null) {
-        const position = Math.max(0, Math.min(this.scheduledUntil, this.outputTime() - this.anchor));
+        const position = Math.max(0, this.position());
         // An output-route/system interruption does not revoke the user's play
         // permission. Freeze both tracks and let the current intent resume them.
         if (this.context.state === 'closed') this.failPlayback(new Error('声音设备已关闭，请刷新播放页'), position);
@@ -423,8 +474,7 @@ export class Player {
       const stream = this.stream;
       try {
         await this.loading;
-        // During playback pump() advances the decoded window on the audio
-        // clock. A mix update's wall-clock position can be a window ahead.
+        // During playback pump() advances the decoded window on the audio clock.
         if (this.anchor !== null && stream.at(position)) return;
         if (!stream.signal.aborted) await Promise.all([stream.prepare(position),
           this.anchor === null ? videoReady(this.video, stream.signal, position) : Promise.resolve()]);
@@ -467,14 +517,10 @@ export class Player {
     if (state.levels) this.setLevels(state.levels);
     else this.setMix(state.mix);
     if (!this.ready || this.entry?.id !== state.current_id) return;
-    const position = Math.min(this.entry.duration, state.position +
-      (state.playing && state.started_at ? Math.max(0, Date.now()/1000 + clockOffset - state.started_at) : 0));
+    const position = Math.min(this.entry.duration, state.position);
     if (!state.playing || !state.started_at || !this.unlocked) {
       this.stop();
-      // An unopened playback tab may receive another device's playing clock.
-      // Keep its preview still instead of seeking on every preparation event.
-      const preview = this.unlocked ? position : state.position;
-      if (Math.abs(this.video.currentTime - preview) > .04) this.video.currentTime = preview;
+      if (Math.abs(this.video.currentTime - position) > .04) this.video.currentTime = position;
       this.onTick(position);
       return;
     }

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
-import {createVideoSearch, createViewHistory, previewURL, searchLibrary, artistLibrarySongs, librarySongs, paginateSongs, filterSongs, playCount, orderResults, queueKey, queuePosition, queuePositions, libraryArtists, historySuggestions} from './web/search.js';
+import {createVideoSearch, createViewHistory, previewURL, searchLibrary, artistLibrarySongs, librarySongs, paginateSongs, filterSongs, playCount, orderResults, queueKey, queuePosition, queuePositions, libraryArtists, historySuggestions, lyricLabel} from './web/search.js';
 
 function setup() {
   const requests = [], snapshots = [];
@@ -738,10 +738,17 @@ test('a cancelled lyric batch cannot repaint a new query, including the same rec
 
 test('lyric priority keeps unconfirmed versions and separates availability from readiness', () => {
   const expiry=Date.now()/1000+300;
+  const missing={title:'Missing',status:'completed',lyrics_unavailable:true,lyrics_need_review:true,
+    lyrics:{status:'available',expires_at:expiry}};
+  const review={title:'Review',status:'completed',lyrics_need_review:true};
   const songs=[{title:'Unchecked'}, {title:'Expired',lyrics:{status:'available',expires_at:0}},
+    missing,review,
     {title:'Found',lyrics:{status:'available',expires_at:expiry}}, {title:'Failed',lyrics:{status:'unknown',expires_at:expiry}},
     {title:'Ready',status:'completed'}];
-  assert.deepEqual(orderResults(songs,'lyrics').map(s=>s.title),['Found','Ready','Unchecked','Expired','Failed']);
-  assert.deepEqual(orderResults(songs,'ready').map(s=>s.title),['Ready','Unchecked','Expired','Found','Failed']);
+  assert.equal(lyricLabel(missing).text,'歌词暂缺');
+  assert.equal(lyricLabel(review).text,'歌词待校对');
+  assert.deepEqual(librarySongs(songs).map(s=>s.title),['Review','Ready']);
+  assert.deepEqual(orderResults(songs,'lyrics').map(s=>s.title),['Found','Ready','Review','Unchecked','Expired','Missing','Failed']);
+  assert.deepEqual(orderResults(songs,'ready').map(s=>s.title),['Review','Ready','Unchecked','Expired','Missing','Found','Failed']);
   assert.equal(songs[0].title,'Unchecked');
 });

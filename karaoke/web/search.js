@@ -102,10 +102,10 @@ export function createVideoSearch(onChange, fetcher = fetch, getLocal = () => []
     }
     notify();
   }
-  function refreshLocal() {
+  function refreshLocal(sourceChanged = false) {
     if (!active) return;
     const results = getLocal(active.query);
-    if (JSON.stringify(results) === JSON.stringify(active.providers.local.results)) return;
+    if (!sourceChanged && JSON.stringify(results) === JSON.stringify(active.providers.local.results)) return;
     active.providers.local = {loading:false, results, error:''};
     onChange(active.providers, active.mode);
   }
@@ -171,8 +171,10 @@ export function createVideoSearch(onChange, fetcher = fetch, getLocal = () => []
 }
 
 export function lyricLabel(song) {
+  if (song.lyrics_unavailable) return {text:'歌词暂缺', available:false, title:'这版录音还没有可用字幕。点歌后会重新准备。'};
+  if (song.lyrics_need_review) return {text:'歌词待校对', available:true, title:'已有歌词，正文或字幕时间还需校对。'};
   if (song.status === 'completed' || (song.lyrics?.status === 'available' && song.lyrics.expires_at > Date.now()/1000)) {
-    return {text:'有歌词', available:true, title:'已找到对应录音的歌词正文；新歌仍需完成音轨分离、字幕对齐和视频生成。'};
+    return {text:'有歌词', available:true, title:'已找到这版录音的歌词。'};
   }
   return song.lyrics ? {text:'歌词未确认', available:false, title:'暂未确认这版录音的歌词，可能尚未收录或来源暂不可用。可以换一个版本；点歌后仍会尝试其他歌词来源。'} :
     {text:'歌词待查', available:false, title:'正在检查这版录音是否有已发表的歌词。'};
@@ -279,7 +281,7 @@ export function artistLibrarySongs(library, name, catalogue = []) {
 }
 
 export function librarySongs(library, filter = 'all', query = '') {
-  return filterSongs(library, query).filter(song => song.status === 'completed' &&
+  return filterSongs(library, query).filter(song => readyToSing(song) &&
     (filter === 'all' || (filter === 'other' ?
       song.language && !['Chinese','Cantonese','English','Japanese','Korean'].includes(song.language) :
       song.language === filter)));
@@ -330,10 +332,17 @@ export function playCount(value) {
   return match ? Number(match[1])*({K:1e3, M:1e6, B:1e9, 千:1e3, 万:1e4, 萬:1e4, 亿:1e8, 億:1e8}[match[2]?.toUpperCase()] || 1) : null;
 }
 
+function readyToSing(song) {
+  return song.status === 'completed' && !song.lyrics_unavailable;
+}
+
 export function orderResults(songs, order) {
-  if (order === 'lyrics') return [...songs].sort((a,b) => Number(lyricLabel(b).available)-Number(lyricLabel(a).available));
+  if (order === 'lyrics') {
+    const rank = song => !lyricLabel(song).available ? 0 : song.lyrics_need_review ? 1 : 2;
+    return [...songs].sort((a,b) => rank(b)-rank(a));
+  }
   if (order === 'popular') return [...songs].sort((a,b) => (playCount(b.views) ?? -1)-(playCount(a.views) ?? -1));
-  if (order === 'ready') return [...songs].sort((a,b) => Number(b.status === 'completed')-Number(a.status === 'completed'));
+  if (order === 'ready') return [...songs].sort((a,b) => Number(readyToSing(b))-Number(readyToSing(a)));
   if (order === 'title') return [...songs].sort((a,b) => a.title.localeCompare(b.title, 'zh-CN'));
   if (order === 'relevance') {
     // Keep provider order within each group; playable songs precede albums.

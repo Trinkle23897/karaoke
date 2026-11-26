@@ -86,7 +86,7 @@
 
     <section class="main-panel player-panel" id="player-view" hidden aria-label="播放器">
       <div class="section-heading player-heading"><div><h1 id="player-title">未播放</h1><div class="song-info-row"><p id="player-artist"></p><span id="player-elapsed"></span></div></div><button class="icon-button" id="fullscreen" aria-label="全屏播放" title="全屏 · F"><svg class="icon"><use href="#i-full"/></svg></button></div>
-      <div class="player-stage" id="player-stage">
+      <div class="player-stage" id="player-stage" tabindex="-1">
       <div class="screen" id="screen">
         <video id="video" playsinline muted preload="none" aria-label="卡拉 OK 字幕 MV"></video>
         <canvas id="paused-frame" class="paused-frame" aria-hidden="true" hidden></canvas>
@@ -129,7 +129,7 @@
       <div class="transport-track">
         <button class="now-song" id="now-song" aria-label="查看正在播放"><div class="now-art" id="now-art"><span>♪</span></div><div><strong id="now-title">未播放</strong><span id="now-artist"></span></div></button>
       </div>
-      <div class="transport-center"><div class="transport-playback"><div class="transport-buttons"><button class="next-button" id="transport-restart" aria-label="重唱" title="重唱"><svg class="icon"><use href="#i-restart"/></svg>重唱</button><button class="play-button" id="play-toggle" aria-label="播放"><svg class="icon"><use id="play-icon" href="#i-play"/></svg></button><button class="next-button" id="next-song" data-next title="下一首 · N">下一首 <svg class="icon"><use href="#i-next"/></svg></button></div></div><div class="seek-row"><time id="current-time">0:00</time><input id="seek" type="range" min="0" max="1" step="0.1" value="0" aria-label="播放进度"><time id="duration">0:00</time></div></div>
+      <div class="transport-center"><div class="transport-playback"><div class="transport-buttons"><button class="next-button" id="transport-restart" aria-label="重唱" title="重唱"><svg class="icon"><use href="#i-restart"/></svg>重唱</button><button class="play-button" id="play-toggle" aria-label="播放"><svg class="icon"><use id="play-icon" href="#i-play"/></svg></button><button class="next-button" id="next-song" title="下一首 · N">下一首 <svg class="icon"><use href="#i-next"/></svg></button></div></div><div class="seek-row"><time id="current-time">0:00</time><input id="seek" type="range" min="0" max="1" step="0.1" value="0" aria-label="播放进度"><time id="duration">0:00</time></div></div>
       <div class="transport-sound">
         <div class="transport-tools" id="transport-tools">
           <div class="lead-control" role="group" aria-label="主唱音量"><button id="lead-toggle" class="lead-toggle" aria-label="主唱开关" aria-pressed="false">主唱：关</button><button id="lead-down" aria-label="主唱减小 5%" title="主唱减小 5%" disabled>−</button><output id="lead-value" aria-live="polite">0%</output><button id="lead-up" aria-label="主唱增大 5%" title="主唱增大 5%" disabled>＋</button></div>

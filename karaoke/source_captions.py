@@ -75,6 +75,37 @@ def fetch_manual_captions(metadata_path, language, cache):
     return path
 
 
+def reuse_manual_captions(source, target):
+    """Carry verified publisher text across retries; signed URLs can expire."""
+    from .stage_cache import StageCache, digest
+
+    name = 'fetch_source_captions'
+    info_name, text_name = 'download/source.info.json', 'source-captions.json'
+    try:
+        if any((source/p).is_symlink() for p in (info_name, text_name, f'checkpoints/{name}.json')):
+            return False
+        packet = json.loads((source/text_name).read_text())
+        old_info = json.loads((source/info_name).read_text())
+        new_info = json.loads((target/info_name).read_text())
+        record = json.loads((source/'checkpoints'/f'{name}.json').read_text())
+        language = song_language(packet.get('language'))
+        old_track, new_track = manual_track(old_info, language), manual_track(new_info, language)
+        if (packet.get('error') or not packet.get('response') or not old_track or not new_track or
+                packet.get('video_id') != old_info.get('id') or old_info.get('id') != new_info.get('id') or
+                record['config'] != dict(track=old_track, implementation=inspect.getsource(read_document)) or
+                record['inputs'][info_name]['sha256'] != digest(source/info_name) or
+                record['outputs'][text_name]['sha256'] != digest(source/text_name)):
+            return False
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    cache = StageCache(target)
+    with cache.stage(name, inputs=[target/info_name], outputs=[target/text_name],
+                     config=dict(track=new_track, implementation=inspect.getsource(read_document))) as reused:
+        if not reused:
+            (target/text_name).write_text(json.dumps(packet, ensure_ascii=False)+'\n')
+    return True
+
+
 def caption_events(packet, language, duration):
     """Read source display events; their timestamps are not acoustic onsets."""
     if packet.get('error'):
@@ -168,6 +199,7 @@ def prepare_caption_lyrics(request, metadata, duration, cache, model):
     evidence = {key:metadata.get(key) for key in ('title','track','artist','artists','uploader')}
     evidence['caption_lines'] = [dict(number=i+1, text=e['text']) for i,e in enumerate(events)]
     selection = cache.root/'caption-selection.json'
+    selection_error = None
     try:
         with cache.stage('select_caption_lyrics', inputs=[path], outputs=[selection],
                          config=dict(evidence=evidence, model=model),
@@ -175,13 +207,18 @@ def prepare_caption_lyrics(request, metadata, duration, cache, model):
             if not reused:
                 selection.write_text(json.dumps(extract_song_metadata(evidence, model), ensure_ascii=False)+'\n')
     except OpenAIError as error:
-        # This optional source has not supplied lyric text yet. Keep provider
-        # diagnostics without turning a failed selection into invented lyrics.
-        return reject('selection_unavailable', error=provider_error(error) or dict(type=type(error).__name__))
-    result = json.loads(selection.read_text()).get('parsed')
-    if result is None:
-        return reject('invalid_selection')
-    parsed = SongText.model_validate(result)
+        # The publisher's text is already available. If optional selection
+        # fails, retain every line (including speech) rather than lose lyrics.
+        # No omitted ranges need speech exemptions; acoustic alignment still
+        # validates this complete text before it can become a subtitle result.
+        selection_error = provider_error(error) or dict(type=type(error).__name__)
+        parsed = SongText(title=song['title'], artist=song['artist'],
+                          lyric_line_numbers=list(range(1, len(events)+1)))
+    else:
+        result = json.loads(selection.read_text()).get('parsed')
+        if result is None:
+            return reject('invalid_selection')
+        parsed = SongText.model_validate(result)
     chosen = parsed.lyric_line_numbers
     if not chosen or chosen != sorted(set(chosen)) or any(not 1 <= i <= len(events) for i in chosen):
         return reject('invalid_selection')
@@ -203,6 +240,8 @@ def prepare_caption_lyrics(request, metadata, duration, cache, model):
     accepted = speech_intervals(cache.root, reviews)
     report = dict(status='accepted' if accepted == [(r['start'],r['end']) for r in ranges] else 'unverified_omission',
         video_id=packet['video_id'], language=language, lyric_line_numbers=chosen, omitted_ranges=ranges,
+        selection='complete_manual_captions' if selection_error else 'model_selected',
+        **({'selection_error':selection_error} if selection_error else {}),
         response_sha256=hashlib.sha256(json.dumps(packet['response'], sort_keys=True).encode()).hexdigest(),
         provider_timestamps_used_for_alignment=False)
     report_path.write_text(json.dumps(dict(report, reviews=reviews), ensure_ascii=False)+'\n')

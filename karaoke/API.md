@@ -32,6 +32,10 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 普通点歌在歌词查找明确未取得正文、且同一来源的字幕文本回退也未取得歌词时，可返回 `completed`、`validation_scope=playback_without_lyrics`。`cues.json` 与 `lyrics.json.lines` 均为空，`quality.playback_fallback` 记录 `reason=lyrics_not_found`、`subtitle_mode=unavailable` 及原始失败分类，`word_alignment_passed=false`；画面常驻标注「未找到歌词」。跳过歌词对齐与注音，继续原有分离、共同增益、完整解码、文件哈希和视频校验；补视频保留同一提示。已有输入或保存的歌词、对齐错误、查找程序异常和严格音频验收不适用这条回退；不能仅凭空字幕或通用失败状态发布无歌词成品。
 
+普通点歌的人工字幕文本回退先尝试筛选正文，任何省略部分都须确认是对白。筛选请求失败时保留全部人工字幕正文（包括对白），`caption-lyrics-review.json` 记录 `selection=complete_manual_captions` 和脱敏的 `selection_error`。不使用原字幕时间对齐，继续正常声学对齐和完整性校验；成功的 `validation_scope=playback_lyrics_first`，来源仍为 `source_manual_subtitles`。无效筛选结果、不同视频、自动字幕或翻译轨不会因这条回退被接纳；已取得正文后的对齐失败也不能发布为无歌词成品。
+
+重新准备复用下载时，同时查找同一视频的成功人工字幕缓存；来源信息、读取实现与字幕正文哈希必须匹配，目标仍须有同语种人工轨。完成后保留轻量下载检查点，让已过期的签名字幕地址不影响复用；错误响应、损坏正文或缺少校验记录的旧缓存仍重新获取。
+
 | 接口 | 用途 |
 |---|---|
 | `GET /v1/library` | 按来源列出当前任务及已准备／待恢复歌曲，实际文件完整时才标记为已准备 |

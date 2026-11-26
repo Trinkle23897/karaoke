@@ -11,7 +11,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .cache import can_restore_video
+from .cache import can_restore_video, lyrics_unavailable
 from .job_schema import JobRequest, download_backoff, playback_version, thumbnail_url
 
 PRESETS = {
@@ -146,6 +146,7 @@ class Room:
         self.feed = RoomFeed(self)
         with store.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS room (id INTEGER PRIMARY KEY, state TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS removed_songs (id TEXT PRIMARY KEY, job_id TEXT NOT NULL) WITHOUT ROWID')
             initial = dict(entries=[], history=[], current_id=None, playing=False, position=0,
                            started_at=None, mix='karaoke', revision=0)
             db.execute('INSERT OR IGNORE INTO room VALUES (1, ?)', (json.dumps(initial),))
@@ -158,9 +159,17 @@ class Room:
         state.setdefault('history', [])
         return state
 
-    def save(self, state):
+    def save(self, state, *, removed=None):
+        sang = self.remember_song(state, removed)
         state['revision'] += 1
         with self.store.connect() as db:
+            # Another device can still be singing a removed entry. Keep only
+            # its identity until a performance is confirmed, outside SSE data.
+            if removed:
+                if sang:
+                    db.execute('DELETE FROM removed_songs WHERE id=?', (removed['id'],))
+                else:
+                    db.execute('INSERT INTO removed_songs VALUES (?, ?)', (removed['id'], removed['job_id']))
             db.execute('UPDATE room SET state=? WHERE id=1', (json.dumps(state),))
         self.worker.prioritize(self.preparation_order(state))
         self.updates.publish()
@@ -205,6 +214,12 @@ class Room:
         if job is None:
             return dict(**entry, title='歌曲已不可用', artist='', status='failed', artifacts={})
         result, inputs = job.get('result') or {}, job['input']
+        missing = lyrics_unavailable(result)
+        status = 'unprepared' if job['status'] in ('audio_ready', 'source_ready', 'cancelled') else job['status']
+        error = job.get('error')
+        if missing and status in ('completed', 'video_evicted'):
+            status = 'failed'
+            error = dict(code='prepare_lyrics_failed', message='歌词暂缺，请重试以重新准备这首歌')
         artifacts = {key: artifact_url(job['id'], key, value)
                      for key, value in result.get('artifacts', {}).items()
                      if key != 'poster' or (self.store.root/job['id']/value['path']).is_file()}
@@ -214,18 +229,19 @@ class Room:
         return dict(**entry,
             title=inputs.get('title') or result.get('title') or song_info.get('title') or featured.get('title') or '新点的歌',
             artist=inputs.get('artist') or result.get('artist') or song_info.get('artist') or featured.get('artist', ''),
-            url=inputs['url'], status='unprepared' if job['status'] in ('audio_ready', 'source_ready', 'cancelled') else job['status'],
+            url=inputs['url'], status=status,
             active_stages=job.get('active_stages', []),
             stage_progress=job.get('stage_progress', {}) if job['status'] == 'running' else {},
             preparation_started_at=job.get('started_at') if job['status'] == 'running' else None,
             next_retry_at=(job.get('download_retry') or {}).get('next_retry_at') if job['status'] == 'queued' else None,
             language=result.get('language') or song_info.get('language') or inputs.get('language') or featured.get('language', ''),
-            error=job.get('error'), duration=result.get('duration_seconds') or song_info.get('duration_seconds', 0),
+            error=error, duration=result.get('duration_seconds') or song_info.get('duration_seconds', 0),
             poster=(artifacts['poster']
                     if (job['status'] == 'completed' or job.get('restore_video')) and 'poster' in artifacts
-                    else thumbnail_url(song_info.get('thumbnail')) or featured.get('poster')), lyrics_need_review=result.get('quality', {}).get(
-                'lyrics_provenance', {}).get('needs_review', False),
-            lyrics_unavailable=result.get('quality', {}).get('playback_fallback', {}).get('subtitle_mode') == 'unavailable',
+                    else thumbnail_url(song_info.get('thumbnail')) or featured.get('poster')),
+            lyrics_need_review=(result.get('validation_scope') == 'playback_with_lyrics_review' or
+                                result.get('quality', {}).get('lyrics_provenance', {}).get('needs_review', False)),
+            lyrics_unavailable=missing,
             opening_countdown=result.get('quality', {}).get('opening_countdown'),
             artifacts=artifacts, playback_version=playback_version(result))
 
@@ -296,10 +312,16 @@ class Room:
                 continue
             result = job.get('result') or {}
             artifacts = result.get('artifacts', {})
-            ready = job['status'] == 'completed' and bool(artifacts) and all(
+            missing = lyrics_unavailable(result)
+            ready = job['status'] == 'completed' and not missing and bool(artifacts) and all(
                 (self.store.root/job['id']/a['path']).is_file() for name, a in artifacts.items() if name != 'poster')
-            priority = 2 if ready else int(bool(job.get('restore_video')) and
-                can_restore_video(self.store.root/job['id'], result))
+            if ready:
+                priority = 2
+            elif job.get('restore_video') and can_restore_video(self.store.root/job['id'], result):
+                priority = 1
+            else:
+                # Cancelling a replacement must not mask the previous result.
+                priority = -1 if job['status'] == 'cancelled' else 0
             if url in seen and priority <= seen[url]:
                 continue
             seen[url] = priority
@@ -311,9 +333,10 @@ class Room:
                 by_url[url] = song
             song.update({key: info[key] for key in ('title', 'artist', 'url', 'language', 'duration',
                 'poster', 'status', 'active_stages', 'stage_progress', 'preparation_started_at', 'next_retry_at', 'error',
-                'artifacts', 'playback_version')})
-            song['job_id'] = job['id'] if ready or job.get('restore_video') or job['status'] in ('queued', 'running') else None
-            if job['status'] == 'completed' and not ready:
+                'artifacts', 'playback_version', 'lyrics_unavailable', 'lyrics_need_review')})
+            can_add_by_id = ready or missing or job.get('restore_video') or job['status'] in ('queued', 'running')
+            song['job_id'] = job['id'] if can_add_by_id else None
+            if info['status'] == 'completed' and not ready:
                 song.update(status='evicted', poster=None)
         return songs
 
@@ -342,9 +365,10 @@ class Room:
                     break
         if request.job_id:
             job = self.store.read(request.job_id)
-            if job and (request.force or job['status'] in ('evicted', 'video_evicted', 'cancelled', 'audio_ready', 'source_ready') or job.get('restore_video') or
+            missing = job and lyrics_unavailable(job.get('result'))
+            if job and (request.force or missing or job['status'] in ('evicted', 'video_evicted', 'cancelled', 'audio_ready', 'source_ready') or job.get('restore_video') or
                         (not replay and job['status'] == 'completed' and job.get('pipeline_version') != self.version)):
-                version = job['pipeline_version'] if replay and job.get('restore_video') else self.version
+                version = job['pipeline_version'] if replay and job.get('restore_video') and not missing else self.version
                 try:
                     payload = JobRequest(**{**job['input'], 'force': request.force})
                 except ValueError as error:
@@ -385,7 +409,13 @@ class Room:
         entry = next((e for e in state['entries'] if e['id'] == command.entry_id), None)
         action = command.action
         if entry is None and (action == 'finish' or action == 'remove' and command.entry_id):
-            return self.snapshot()  # A retried command or another browser already removed it.
+            if command.playback_started_at is not None:
+                with self.store.connect() as db:
+                    row = db.execute('SELECT job_id FROM removed_songs WHERE id=?', (command.entry_id,)).fetchone()
+                if row:
+                    self.save(state, removed=dict(id=command.entry_id, job_id=row[0],
+                                                  played_at=min(time.time(), command.playback_started_at)))
+            return self.snapshot()
         if action == 'finish' and self.describe(entry)['status'] != 'completed':
             return self.snapshot()  # Skipping an unprepared song must not delete it.
         if action in ('pause', 'seek', 'ready', 'buffering', 'next') and command.entry_id != state['current_id']:
@@ -393,6 +423,7 @@ class Room:
         if action in ('select', 'remove', 'retry', 'reprepare') and entry is None:
             raise HTTPException(404, '歌曲已从歌单移除')
         self.mark_played(state)
+        removed = None
         if action == 'play':
             if current is None and state['entries']:
                 state['current_id'] = state['entries'][0]['id']
@@ -425,11 +456,12 @@ class Room:
         elif action in ('next', 'select'):
             if action == 'next':
                 if current and self.describe(current)['status'] == 'completed':
-                    self.remember_song(state, current)
+                    removed = current
                     state['entries'].remove(current)
                 entry = next((e for e in state['entries'] if e != current), None)
             else:
-                if current != entry and self.remember_song(state, current):
+                if current and current != entry and 'played_at' in current:
+                    removed = current
                     state['entries'].remove(current)
                 state['entries'].remove(entry)
                 state['entries'].insert(0, entry)
@@ -437,9 +469,10 @@ class Room:
                          started_at=None, playing=bool(entry))
         elif action in ('remove', 'finish'):
             assert entry is not None  # Missing entries were handled above.
-            if command.playback_started_at is not None:
-                entry['played_at'] = min(time.time(), command.playback_started_at)
-            self.remember_song(state, entry)
+            if action == 'finish' or self.describe(entry)['status'] == 'completed':
+                if command.playback_started_at is not None:
+                    entry['played_at'] = min(time.time(), command.playback_started_at)
+                removed = entry
             state['entries'].remove(entry)
             if entry == current:
                 following = state['entries'][0] if state['entries'] else None
@@ -473,8 +506,9 @@ class Room:
             assert entry is not None  # Missing entries were handled above.
             old = self.store.read(entry['job_id'])
             waiting = old['status'] == 'queued' and (old.get('download_retry') or {}).get('next_retry_at')
+            missing = lyrics_unavailable(old.get('result'))
             if (action == 'reprepare' and old['status'] != 'completed') or (
-                    action == 'retry' and old['status'] != 'failed' and not waiting):
+                    action == 'retry' and self.describe(entry, old)['status'] != 'failed' and not waiting):
                 raise HTTPException(409, '歌曲状态已改变，请查看最新进度')
             try:
                 payload = JobRequest(**{**old['input'], 'force': action == 'reprepare'})
@@ -488,7 +522,7 @@ class Room:
                 job = self.store.update(old['id'], error=None,
                     download_retry={**old['download_retry'], 'next_retry_at': None, 'count': 0})
                 cached = False
-            elif action == 'retry':
+            elif action == 'retry' and not missing:
                 job, cached = self.store.retry(old['id'], self.version), False
             else:
                 job, cached = self.store.create(payload, self.version)
@@ -498,16 +532,18 @@ class Room:
                 # old media; their later finish event cannot remove this attempt.
                 replacement = dict(id=str(uuid4()), job_id=job['id'])
                 state['entries'][state['entries'].index(entry)] = replacement
+                removed = entry
                 if state['current_id'] == entry['id']:
                     state.update(current_id=None, playing=False, position=0, started_at=None)
-            entry['job_id'] = job['id']
+            else:
+                entry['job_id'] = job['id']
             if not cached:
                 self.worker.queue.put_nowait(job['id'])
         if action in ('play', 'select', 'ready', 'next'):
             selected = next((e for e in state['entries'] if e['id'] == state['current_id']), None)
             if selected:
                 self.store.touch(selected['job_id'])
-        self.save(state)
+        self.save(state, removed=removed)
         if action in ('next', 'remove', 'finish', 'select', 'retry', 'reprepare'):
             self.store.cache.enforce()
         return self.snapshot()

@@ -26,12 +26,22 @@ def valid_artifact(folder, artifact, *, verify_hash):
         return False
 
 
+def lyrics_unavailable(result):
+    """Recognize older subtitle-free results without opening every timeline."""
+    if not result:
+        return False
+    quality = result.get('quality') or {}
+    return (result.get('validation_scope') in ('playback_without_lyrics', 'playback_audio_preview')
+            or quality.get('lines') == 0
+            or (quality.get('playback_fallback') or {}).get('subtitle_mode') == 'unavailable')
+
+
 def can_restore_video(folder, result, *, verify_hash=False):
     """Only discard an MV when its expensive inputs and source identity survive."""
     try:
         artifacts = result['artifacts']
         required = {'subtitles', *playback_stems(artifacts)}
-        if not required <= artifacts.keys() or not result['reconstruction']['source_pcm_sha256']:
+        if lyrics_unavailable(result) or not required <= artifacts.keys() or not result['reconstruction']['source_pcm_sha256']:
             return False
         if not result['language'] or not 0 < result['shared_preview_gain'] <= 1 or result['duration_seconds'] <= 0:
             return False

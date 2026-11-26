@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from .cache import GIB, CacheFull, SongCache, can_restore_video, valid_artifact
+from .cache import GIB, CacheFull, SongCache, can_restore_video, lyrics_unavailable, valid_artifact
 from .job_schema import (
     JobRequest,
     download_backoff,
@@ -129,7 +129,7 @@ def validated_result(folder):
             else:
                 raise ValueError(f'Invalid result artifact: {name}')
     cues = json.loads((folder/artifacts['subtitles']['path']).read_text())
-    if not isinstance(cues, list) or not cues or not all(
+    if lyrics_unavailable(result) or not isinstance(cues, list) or not cues or not all(
             cue['text'].strip() and 0 <= cue['start'] < cue['end'] <= result['duration_seconds']+.001 for cue in cues):
         raise ValueError('No usable subtitle timeline')
     return result
@@ -308,7 +308,8 @@ class Store:
                              COALESCE(json_extract(doc, '$.restore_video'), 0) DESC, created_at DESC""", (payload.url, key, key))
                 for row in rows:
                     doc = json.loads(row[0])
-                    if {k: v for k, v in doc['input'].items() if k != 'force'} != key_payload:
+                    if ({k: v for k, v in doc['input'].items() if k != 'force'} != key_payload
+                            or lyrics_unavailable(doc.get('result'))):
                         continue
                     if doc['status'] == 'audio_ready' and can_restore_video(self.root/doc['id'], doc.get('audio_result')):
                         result = {**doc['audio_result'], 'artifacts':{**doc['audio_result']['artifacts'],

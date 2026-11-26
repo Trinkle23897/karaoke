@@ -28,7 +28,7 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 处理中的房间条目和曲库歌曲通过 `preparation_started_at` 提供本次开始时间（ISO 8601），其他状态为 `null`。前端结合快照的 `server_time` 校正时钟并显示累计用时，不额外轮询；重试使用新一次处理的开始时间。
 
-房间条目的 `lyrics_unavailable` 表示成品没有可显示字幕；`lyrics_need_review` 表示歌词或对齐尚待复核，两者不能混为同一个提示。
+待唱 `entries`、本机选曲 `playback_entry` 和曲库 `library` 的任务条目都带歌词标记。`lyrics_unavailable` 表示缺字幕，优先于 `lyrics_need_review`（歌词或对齐待复核）。旧成品明确缺字幕时按准备失败展示。按任务 ID 点歌或原位 `retry` 都会按原请求重新准备。
 
 常规歌词查找和同源人工字幕都未取得正文时，任务必须返回 `failed`、`error.code=prepare_lyrics_failed`，保留音轨与查找诊断，不发布无字幕成品。空字幕时间轴一律不能通过产物验收，旧的 `playback_without_lyrics` 标记也不例外；已有正文的对齐失败继续按原有规则处理。
 
@@ -48,9 +48,9 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 兼容旧客户端的 `pause`、`seek`、`next`、`ready` 必须带 `entry_id`，防止旧播放器事件影响新歌曲。`reorder` 传入完整的 `order` ID 数组，可带 `revision` 拒绝过期操作；调序不改变设备正在播放的歌。`mix` 接受 `instrumental`（纯伴奏）、`karaoke`（伴奏＋伴唱）、`original`（三轨一起播放）。
 
-网页不使用服务端的 `current_id`、`playing`、`position`、`started_at`、`mix`、`levels`、`pitch_semitones` 控制播放。这些旧 API 字段仅为兼容保留；网页的播放命令、媒体就绪握手和缓冲处理全部在设备本地进行。播放状态经 localStorage 在同一浏览器标签页间共享，只有取得发声权的标签页播放；搜索与页面导航状态保存在各标签页的 sessionStorage。刷新后仍受浏览器声音授权限制，不跟随其他设备起播。
+服务端的 `current_id`、`playing`、`position`、`started_at`、`mix`、`levels`、`pitch_semitones` 供旧客户端使用。网页在本机处理播放、媒体就绪与缓冲。同一浏览器通过 `localStorage` 共享播放状态，演唱与试听由持有发声权的标签页播放。各标签页的搜索和导航保存在 `history.state`。刷新后可能需要重新启用声音。
 
-跳过仍在准备的歌只改变本机选曲，原条目留在待唱。已准备的歌切到下一首或唱完时发送 `finish`；明确点击「移除」发送 `remove`。两种命令都绑定 `entry_id`，浏览器保存原命令直到服务端确认，刷新后也可重试。同一条目只移除一次。实际起播时间 `playback_started_at` 以 Unix 秒计；尚未开唱时传 `null`，不新增已唱记录。
+跳过仍在准备的歌只改变本机选曲，原条目留在待唱。已准备的歌切到下一首或唱完时发送 `finish`；明确点击「移除」发送 `remove`。两种命令都绑定 `entry_id`。浏览器保存本机选曲的结束命令直到收到确认。音频输出开始后发送起播时间 `playback_started_at`（Unix 秒），此前切歌传 `null`。可唱条目先被移除时，服务端保存原条目与任务 ID，收到迟到的起播记录后补记已唱。重复确认只记一次，同一任务的新待唱项有独立的 ID。
 
 `GET /v1/room/events?job_id=…` 在 SSE 存续期间保护本机当前歌曲的缓存，并在快照的 `playback_entry` 中推送该任务的最新元数据；即使该歌曲不再位于共享待唱列表，也保持可播放。关闭连接释放保护，连接和状态推送不刷新 LRU 访问时间。
 
@@ -464,7 +464,7 @@ LINE、网易云和 LRCLIB 的歌词候选不再因歌手名的别名、译名�
 
 ## 两轨播放与存储迁移
 
-普通播放的音频 artifact 为 `accompaniment`（背景音乐＋伴唱）与 `lead_vocals`，音频存储记录 `audio_storage.layout=accompaniment_and_lead`。新 MV 记录 `video_audio=silent_aac`，含静音 AAC 兼容轨；旧的 `video_only=true` 表示历史纯视频容器。`/playback` 返回 `stems`，客户端按列表加载；旧三轨成品仍可播放。所有声部使用同一增益；预览也读取独立音轨。
+普通播放的音频 artifact 为 `accompaniment`（背景音乐＋伴唱）与 `lead_vocals`，音频存储记录 `audio_storage.layout=accompaniment_and_lead`。新 MV 记录 `video_audio=silent_aac`，含静音 AAC 兼容轨；旧的 `video_only=true` 表示历史纯视频容器。`/playback` 返回 `stems`，客户端按列表加载；旧三轨成品仍可播放。所有声部使用同一增益。有声试听读取独立音轨，静音预览只读取 MV。
 
 停止服务后可运行 `python -m karaoke.tools.compact_storage --data 数据目录`，通过同一 `worker.lock` 防止与服务并发迁移。先验证原产物，生成两轨并逐块验证量化误差，核对去音轨前后的全长视频像素哈希，再发布清单与清理中间文件。原处理版本、任务 ID 和歌单不变。相同内容的最终 FLAC/MP4 通过校验后共享硬链接，缓存统计按唯一 inode 计数，单个任务的回收不删除其他引用。
 

@@ -197,9 +197,56 @@ def test_room_distinguishes_missing_lyrics_from_alignment_review(tmp_path):
             result = dict(job['result'], quality=dict(lyrics_provenance=dict(needs_review=True),
                                                      playback_fallback=dict(subtitle_mode=mode)))
             app.state.store.update(job['id'], result=result)
-            song = client.get('/v1/room').json()['entries'][0]
-            assert song['lyrics_need_review']
-            assert song['lyrics_unavailable'] == (mode == 'unavailable')
+            snapshot = client.get('/v1/room').json()
+            for song in (snapshot['entries'][0], snapshot['library'][0]):
+                assert song['lyrics_need_review']
+                assert song['lyrics_unavailable'] == (mode == 'unavailable')
+                assert song['status'] == ('failed' if mode == 'unavailable' else 'completed')
+
+
+@pytest.mark.parametrize('point_by', ['job_id', 'url', 'retry'])
+def test_legacy_empty_subtitles_are_prepared_only_on_request(tmp_path, point_by):
+    app = create_app(tmp_path, version='test', worker_command=fake_worker)
+    room, store = app.state.room, app.state.store
+    old = ready_job(store)
+    if point_by == 'retry':
+        original = room.add(AddSong(job_id=old['id']))['entries'][0]
+    result = dict(old['result'], validation_scope='playback_without_lyrics')
+    store.update(old['id'], result=result)
+    with TestClient(app) as client:
+        song = client.get('/v1/room').json()['library'][0]
+        assert song['lyrics_unavailable'] and song['status'] != 'completed'
+        assert len(store.list()) == 1
+        if point_by == 'retry':
+            response = client.post('/v1/room/commands', json={'action':'retry', 'entry_id':original['id']})
+            assert response.json()['entries'][0]['id'] == original['id']
+        else:
+            response = client.post('/v1/room/entries', json={point_by:old['id'] if point_by == 'job_id' else URL})
+        fresh = response.json()['entries'][0]
+        assert fresh['job_id'] != old['id']
+        assert finished(client, fresh['job_id'])['status'] == 'completed'
+        snapshot = client.get('/v1/room').json()
+        assert len(snapshot['entries']) == 1 and snapshot['entries'][0]['id'] == fresh['id']
+        assert snapshot['library'][0]['job_id'] == fresh['job_id']
+        assert not snapshot['library'][0]['lyrics_unavailable']
+        assert store.read(old['id'])['result'] == result
+
+
+def test_cancelling_a_new_attempt_keeps_the_missing_lyrics_warning_and_original_request(tmp_path):
+    app = create_app(tmp_path, version='test', worker_command=fake_worker)
+    store = app.state.store
+    old = ready_job(store)
+    store.update(old['id'], input=dict(old['input'], title='My recording'),
+                 result=dict(old['result'], quality={'lines':0}))
+    (tmp_path/'preparation.pause').touch()
+    with TestClient(app) as client:
+        song = client.get('/v1/room').json()['library'][0]
+        queued = client.post('/v1/room/entries', json={'job_id':song['job_id']}).json()['entries'][0]
+        assert queued['status'] == 'queued' and queued['title'] == 'My recording'
+        removed = client.post('/v1/room/commands', json={'action':'remove','entry_id':queued['id']}).json()
+        assert not removed['entries']
+        assert removed['library'][0]['lyrics_unavailable']
+        assert removed['library'][0]['job_id'] == old['id']
 
 
 def test_poster_survives_cleanup_and_browsing_does_not_refresh_lru(tmp_path):
@@ -396,6 +443,24 @@ def test_device_finish_is_idempotent_and_does_not_move_another_legacy_transport(
         assert repeated['revision'] == done['revision'] and repeated['history'] == done['history']
 
 
+@pytest.mark.parametrize('action', ['remove', 'finish'])
+def test_late_performance_is_recorded_once_without_removing_a_repeat(tmp_path, action):
+    room = create_app(tmp_path, version='test').state.room
+    job = ready_job(room.store)
+    entry = room.add(AddSong(job_id=job['id']))['entries'][0]
+    removed = room.command(RoomCommand(action=action, entry_id=entry['id']))
+    assert removed['history'] == [] and removed['entries'] == []
+    room = create_app(tmp_path, version='test').state.room
+    repeat = room.add(AddSong(job_id=job['id']))['entries'][0]
+    finish = RoomCommand(action='finish', entry_id=entry['id'], playback_started_at=time.time()-3)
+    done = room.command(finish)
+    assert done['entries'] == [repeat]
+    assert [(s['id'],s['job_id'],s['played_at']) for s in done['history']] == [
+        (entry['id'],job['id'],finish.playback_started_at)]
+    assert room.command(finish)['revision'] == done['revision']
+    assert room.command(finish.model_copy(update={'entry_id':'unknown'}))['history'] == done['history']
+
+
 @pytest.mark.parametrize('status', ['queued', 'running', 'failed', 'audio_ready'])
 def test_unprepared_queue_entry_survives_finish_and_skip_until_explicit_removal(tmp_path, status):
     app = create_app(tmp_path, version='test')
@@ -413,6 +478,8 @@ def test_unprepared_queue_entry_survives_finish_and_skip_until_explicit_removal(
     assert skipped['history'] == []
     removed = room.command(RoomCommand(action='remove', entry_id=entry['id']))
     assert removed['entries'] == [] and removed['history'] == []
+    late = room.command(RoomCommand(action='finish', entry_id=entry['id'], playback_started_at=time.time()))
+    assert late['history'] == [] and late['revision'] == removed['revision']
 
 
 def test_request_only_device_cannot_reorder_a_live_performance_behind_other_songs(tmp_path):
@@ -1100,6 +1167,8 @@ def test_reprepare_keeps_old_media_and_retired_finish_cannot_remove_new_attempt(
         assert (folder/'mv').read_bytes() == b'media'
         assert (tmp_path/fresh['job_id']/'download/source.mkv').read_bytes() == b'original source'
         assert room.command(RoomCommand(action='finish', entry_id=entry['id']))['entries'] == snapshot['entries']
+        done = room.command(RoomCommand(action='finish', entry_id=entry['id'], playback_started_at=time.time()-2))
+        assert done['history'][0]['job_id'] == old['id'] and done['entries'] == snapshot['entries']
         with pytest.raises(HTTPException):
             room.command(RoomCommand(action='reprepare', entry_id=entry['id']))
         assert len(store.list(-1)) == 2

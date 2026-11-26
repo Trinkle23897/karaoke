@@ -30,7 +30,7 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 房间条目的 `lyrics_unavailable` 表示成品没有可显示字幕；`lyrics_need_review` 表示歌词或对齐尚待复核，两者不能混为同一个提示。
 
-普通点歌在歌词查找明确未取得正文、且同一来源的字幕文本回退也未取得歌词时，可返回 `completed`、`validation_scope=playback_without_lyrics`。`cues.json` 与 `lyrics.json.lines` 均为空，`quality.playback_fallback` 记录 `reason=lyrics_not_found`、`subtitle_mode=unavailable` 及原始失败分类，`word_alignment_passed=false`；画面常驻标注「未找到歌词」。跳过歌词对齐与注音，继续原有分离、共同增益、完整解码、文件哈希和视频校验；补视频保留同一提示。已有输入或保存的歌词、对齐错误、查找程序异常和严格音频验收不适用这条回退；不能仅凭空字幕或通用失败状态发布无歌词成品。
+常规歌词查找和同源人工字幕都未取得正文时，任务必须返回 `failed`、`error.code=prepare_lyrics_failed`，保留音轨与查找诊断，不发布无字幕成品。空字幕时间轴一律不能通过产物验收，旧的 `playback_without_lyrics` 标记也不例外；已有正文的对齐失败继续按原有规则处理。
 
 普通点歌的人工字幕文本回退先尝试筛选正文，任何省略部分都须确认是对白。筛选请求失败时保留全部人工字幕正文（包括对白），`caption-lyrics-review.json` 记录 `selection=complete_manual_captions` 和脱敏的 `selection_error`。不使用原字幕时间对齐，继续正常声学对齐和完整性校验；成功的 `validation_scope=playback_lyrics_first`，来源仍为 `source_manual_subtitles`。无效筛选结果、不同视频、自动字幕或翻译轨不会因这条回退被接纳；已取得正文后的对齐失败也不能发布为无歌词成品。
 

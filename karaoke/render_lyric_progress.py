@@ -173,7 +173,6 @@ def main():
     parser.add_argument('--audio', type=Path)
     parser.add_argument('--video-only', action='store_true', help='Render the picture before final audio is ready')
     parser.add_argument('--cues', type=Path, required=True)
-    parser.add_argument('--lyrics-unavailable', action='store_true', help='Show a persistent missing-lyrics notice')
     parser.add_argument('--readings', type=Path, help='Source-bound lyric pronunciation annotations')
     parser.add_argument('--song-info', type=Path,
                         help='JSON with title, optional artist and version for opening credits')
@@ -193,8 +192,8 @@ def main():
     if args.output.exists():
         raise FileExistsError(args.output)
     cues = json.loads(args.cues.read_text())
-    if args.lyrics_unavailable and cues:
-        raise ValueError('Missing-lyrics notice cannot replace found subtitles')
+    if not isinstance(cues, list) or not cues:
+        raise ValueError('No usable subtitle timeline')
     annotations, reading_source = load_readings(args.readings, cues, args.language) if args.readings else ([], None)
     readings = [resolve_readings(cue['text'], annotations[i]['spans'] if i < len(annotations)
                 and annotations[i]['text'] == cue['text'] else (), args.language) for i, cue in enumerate(cues)]
@@ -266,10 +265,6 @@ def main():
         '-t', str(args.duration), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19',
         '-threads', '4', '-movflags', '+faststart', str(args.output)]
     blank = Image.new('RGBA', (width, height))
-    if args.lyrics_unavailable:
-        blank.alpha_composite(caption_image('未找到歌词', width=width, height=main_height,
-            style=args.style, language='Chinese', style_overrides={
-                'size':40, 'minimum_size':40, 'single_line_floor':40, 'maximum_lines':1}))
     cue_starts = [c['start'] for c in cues]
     countdown = countdown_events(cues, minimum_silence=TOKENS['countdown']['minimum_silence_seconds'],
         dots=TOKENS['countdown']['dots'], step_seconds=TOKENS['countdown']['step_seconds'],
@@ -354,7 +349,6 @@ def main():
         'style_parameters': STYLES[args.style],
         'font': 'Bold Songti / Hiragino Mincho W6; source glyphs verified',
         'shown_lines': sorted(i+1 for i in shown),
-        'lyrics_unavailable': args.lyrics_unavailable,
         'display_pages': pagination,
         'furigana': readings_report,
         'reading_source': reading_source,

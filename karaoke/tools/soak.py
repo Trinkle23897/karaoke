@@ -21,13 +21,7 @@ from typing import Any
 
 import httpx
 
-from karaoke.job_schema import (
-    lyrics_not_found,
-    playback_stems,
-    provider_error,
-    retry_fields,
-    video_url,
-)
+from karaoke.job_schema import playback_stems, provider_error, retry_fields, video_url
 from karaoke.local_asr import offline
 
 REQUIRED = {'mv', 'instrumental', 'backing_vocals', 'lead_vocals', 'subtitles',
@@ -231,8 +225,7 @@ def verify_outputs(client, base, data_dir, job, *, audio_only=False, playback_po
     if result.get('audio_storage') and result['shared_preview_gain'] != 1:
         raise ValueError('Compact playback audio must not apply its common gain twice')
     cues = json.loads(paths['subtitles'].read_text())
-    without_lyrics = playback_policy and lyrics_not_found(result)
-    if not cues and not without_lyrics:
+    if not cues:
         raise ValueError('No usable subtitles; audio and diagnostics retained')
     units = [u for cue in cues for u in cue['units']]
     duration = result['duration_seconds']
@@ -261,10 +254,8 @@ def verify_outputs(client, base, data_dir, job, *, audio_only=False, playback_po
             raise ValueError('Word timing falls outside acoustic phrase context')
     if playback_policy:
         lyrics = json.loads((folder/'lyrics.json').read_text())
-        if (not units and not without_lyrics) or [c['text'] for c in cues] != lyrics['lines']:
+        if not units or [c['text'] for c in cues] != lyrics['lines']:
             raise ValueError('Subtitles omit supplied lyric text')
-        if without_lyrics and cues:
-            raise ValueError('Missing-lyrics playback must not contain subtitles')
     else:
         from karaoke.song_sources import lyric_coverage, missing_repetitions
         from karaoke.vocal_review import speech_intervals
@@ -293,8 +284,7 @@ def verify_outputs(client, base, data_dir, job, *, audio_only=False, playback_po
         command = ['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-i', str(paths[name])]
         command += sum((['-map', '0:'+kind[0]+':0'] for kind in sorted(needed)), [])
         subprocess.run(command+['-f', 'null', '-'], check=True, capture_output=True, timeout=300)
-    return dict(validation_scope=('playback_without_lyrics' if without_lyrics else
-                                  'playback_audio' if playback_policy and audio_only else
+    return dict(validation_scope=('playback_audio' if playback_policy and audio_only else
                                   'audio_and_lyrics' if audio_only else 'full_mv'),
                 artifact_sha256=hashes, audio_format=audio_format,
                 subtitle_lines=len(cues), subtitle_units=len(units),

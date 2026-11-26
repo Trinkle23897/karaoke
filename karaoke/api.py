@@ -33,7 +33,6 @@ from .cache import GIB, CacheFull, SongCache, can_restore_video, valid_artifact
 from .job_schema import (
     JobRequest,
     download_backoff,
-    lyrics_not_found,
     playback_stems,
     playback_version,
     preparation_rank,
@@ -130,10 +129,7 @@ def validated_result(folder):
             else:
                 raise ValueError(f'Invalid result artifact: {name}')
     cues = json.loads((folder/artifacts['subtitles']['path']).read_text())
-    if lyrics_not_found(result):
-        if cues != [] or json.loads((folder/'lyrics.json').read_text()).get('lines') != []:
-            raise ValueError('Missing-lyrics playback must not omit found text')
-    elif not isinstance(cues, list) or not cues or not all(
+    if not isinstance(cues, list) or not cues or not all(
             cue['text'].strip() and 0 <= cue['start'] < cue['end'] <= result['duration_seconds']+.001 for cue in cues):
         raise ValueError('No usable subtitle timeline')
     return result

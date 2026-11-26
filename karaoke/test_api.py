@@ -257,7 +257,7 @@ else:
 
 
 @pytest.mark.parametrize('case', ['missing', 'alignment_failure', 'found_text', 'unclassified', 'damaged_audio'])
-def test_only_explicit_lyric_lookup_miss_publishes_without_subtitles(tmp_path, case):
+def test_missing_lyrics_never_publish_even_with_legacy_fallback_marker(tmp_path, case):
     def worker(folder):
         after = """r=json.loads((p/'result.json').read_text()); case=sys.argv[2]
 (p/'cues.json').write_text('[]')
@@ -277,16 +277,10 @@ if case=='damaged_audio': (p/'lead.wav').write_bytes(b'damaged')
     with TestClient(app) as client:
         entry = client.post('/v1/room/entries', json={'url':URL}).json()['entries'][0]
         job = finished(client, entry['job_id'])
-        assert job['status'] == ('completed' if case == 'missing' else 'failed')
+        assert job['status'] == 'failed'
         song = client.get('/v1/room').json()['entries'][0]
-        if case == 'missing':
-            assert song['lyrics_unavailable'] and not song['lyrics_need_review']
-            assert client.get(song['artifacts']['subtitles']).json() == []
-            assert client.get(song['artifacts']['mv'], headers={'Range':'bytes=0-127'}).status_code == 206
-            assert json.loads((tmp_path/job['id']/'lyrics-first-lookup.json').read_text())['status'] == 'no_matching_published_text'
-            assert json.loads((tmp_path/job['id']/'playback-warning.json').read_text())['reason'] == 'lyrics_not_found'
-        else:
-            assert job['error']['code'] == 'worker_error' and not song['artifacts']
+        assert job['error']['code'] == 'worker_error' and not song['artifacts']
+        assert json.loads((tmp_path/job['id']/'lyrics-first-lookup.json').read_text())['status'] == 'no_matching_published_text'
 
 
 @pytest.mark.parametrize('rate,playback_rate', [(16000,48000), (44100,48000), (48000,44100)])
@@ -6290,7 +6284,7 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
         if failure == 'dependency_overlap':
             assert sf.info(tmp_path/'vocals-16k.wav').samplerate == 16000
             assert (tmp_path/'vocals-asr.mp3').exists() == strict
-    elif strict or failure in ('previous_lyrics', 'supplied_lyrics', 'separate_lead', 'package_three_stems', 'no_subtitles', 'caption_alignment_error', 'validate_timing'):
+    elif strict or failure in ('lyrics_not_found', 'previous_lyrics', 'supplied_lyrics', 'separate_lead', 'package_three_stems', 'no_subtitles', 'caption_alignment_error', 'validate_timing'):
         with pytest.raises(StageFailure) as caught:
             pipeline.execute()
         assert not (tmp_path/'result.json').exists()
@@ -6302,6 +6296,9 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
             assert json.loads((tmp_path/'playback-warning.json').read_text())['omitted_lines'] == [1]
         elif failure in ('lyrics_not_found', 'previous_lyrics', 'supplied_lyrics', 'caption_text', 'caption_alignment_error'):
             assert isinstance(caught.value, LyricsNotFound)
+            assert not (tmp_path/'mv.mp4').exists()
+            assert (tmp_path/'stems/lead.wav').is_file()
+            assert not alignment_started.is_set() and validated == []
         else:
             assert str(caught.value) == 'fixture failure'
     elif failure == 'caption_text':
@@ -6312,22 +6309,6 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
         assert json.loads((tmp_path/'cues.json').read_text()) == coarse
         assert json.loads((tmp_path/'lyrics.json').read_text())['provenance']['kind'] == 'source_manual_subtitles'
         assert 'playback_fallback' not in result['quality']
-    elif failure == 'lyrics_not_found':
-        from karaoke.api import validated_result
-        result = pipeline.execute()
-        assert result['validation_scope'] == 'playback_without_lyrics'
-        assert result['quality']['playback_fallback']['reason'] == 'lyrics_not_found'
-        assert result['quality']['playback_fallback']['subtitle_mode'] == 'unavailable'
-        assert not result['quality']['lyrics_provenance']['needs_review']
-        assert json.loads((tmp_path/'cues.json').read_text()) == []
-        assert json.loads((tmp_path/'lyrics.json').read_text())['lines'] == []
-        assert not alignment_started.is_set() and validated == []
-        assert set(result['artifacts']) >= {'accompaniment', 'lead_vocals', 'subtitles'}
-        if not audio_only:
-            assert validated_result(tmp_path)['validation_scope'] == 'playback_without_lyrics'
-            (tmp_path/'lyrics.json').write_text(json.dumps(lyrics))
-            with pytest.raises(ValueError, match='must not omit found text'):
-                validated_result(tmp_path)
     else:
         result = pipeline.execute()
         assert result['validation_scope'] == 'playback_with_lyrics_review'
@@ -7638,30 +7619,15 @@ def test_auxiliary_intro_and_long_preview_cannot_abort_valid_lyric_video(tmp_pat
     assert json.loads((tmp_path/'cues.json').read_text()) == cues
 
 
-def test_missing_lyrics_notice_is_visible_throughout_video_without_lyric_times(tmp_path, monkeypatch):
+def test_lyric_renderer_rejects_missing_text(tmp_path, monkeypatch):
     import karaoke.render_lyric_progress as renderer
-    source, output, cues = tmp_path/'source.mp4', tmp_path/'output.mp4', tmp_path/'cues.json'
-    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=25:d=0.4',
-        '-c:v', 'libx264', str(source)], check=True)
+    cues, output = tmp_path/'cues.json', tmp_path/'output.mp4'
     cues.write_text('[]')
-    argv = ['render', '--video', str(source), '--video-only', '--cues', str(cues),
-        '--lyrics-unavailable', '--language', 'Japanese', '--duration', '0.4', '--output', str(output)]
-    monkeypatch.setattr(sys, 'argv', argv)
-    renderer.main()
-    report = json.loads(output.with_suffix('.render.json').read_text())
-    assert report['shown_lines'] == [] and report['countdown']['events'] == []
-    assert report['furigana'] == {} and json.loads(cues.read_text()) == []
-    frames = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output),
-        '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
-    frames = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 720, 1280, 3)
-    for frame in (frames[0], frames[-1]):
-        region = frame[350:650, 300:980].astype(int)
-        white = (region.min(axis=2) > 150) & (np.ptp(region, axis=2) < 30)
-        assert white.sum() > 500, 'Missing persistent text in the encoded video'
-    cues.write_text(json.dumps([dict(text='Found lyrics', start=0, end=.4, units=[])]))
-    monkeypatch.setattr(sys, 'argv', [*argv[:-1], str(tmp_path/'invalid.mp4')])
-    with pytest.raises(ValueError, match='cannot replace found subtitles'):
+    monkeypatch.setattr(sys, 'argv', ['render', '--video', str(tmp_path/'source.mp4'),
+        '--cues', str(cues), '--language', 'Japanese', '--duration', '1', '--output', str(output)])
+    with pytest.raises(ValueError, match='No usable subtitle timeline'):
         renderer.main()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize('second_start,first_end', [(0., .1), (-.1, .1), (.2, 0.)])
@@ -8487,19 +8453,14 @@ def test_audio_pipeline_runs_separation_and_alignment_but_cannot_claim_a_full_mv
     for policy in (True, False):
         with pytest.raises(ValueError, match='No usable subtitles'):
             verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=policy)
-    # Empty captions are allowed only for a recorded lookup miss in playback;
-    # they must still fail strict acceptance and cannot hide existing words.
+    # Legacy fallback markers cannot turn an empty timeline into a valid result.
     result['validation_scope'] = 'playback_without_lyrics'
     result['quality']['playback_fallback']['reason'] = 'lyrics_not_found'
     (folder/'audio-result.json').write_text(json.dumps(result))
-    with pytest.raises(ValueError, match='omit supplied lyric text'):
-        verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=True)
     (folder/'lyrics.json').write_text(json.dumps(dict(lines=[])))
-    missing = verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=True)
-    assert missing['validation_scope'] == 'playback_without_lyrics'
-    assert missing['subtitle_lines'] == missing['subtitle_units'] == 0
-    with pytest.raises(ValueError, match='No usable subtitles'):
-        verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True)
+    for policy in (True, False):
+        with pytest.raises(ValueError, match='No usable subtitles'):
+            verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=policy)
     result['validation_scope'] = 'audio_and_lyrics'
     (folder/'lyrics.json').write_text(json.dumps(dict(lines=['Hello'])))
     result['quality'].pop('playback_fallback')

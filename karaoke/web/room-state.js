@@ -258,7 +258,7 @@ export class LocalPlayback {
     }
     else if (action === 'pause') Object.assign(state, {position:this.position(), playing:false, started_at:null});
     else if (this.entry) {
-      if (action === 'restart') Object.assign(state, {position:0, started_at:null, pitch_semitones:0});
+      if (action === 'restart') Object.assign(state, {position:0, started_at:null});
       else if (action === 'seek') Object.assign(state, {position:bounded(extra.position, 0, Math.max(0, (this.entry.duration || 0)-.05), 0), started_at:null});
       else if (action === 'ready' && state.playing && state.started_at === null && this.entry.status === 'completed') {
         this.skipped.clear(); // After the next song starts, skipped entries can be selected again.

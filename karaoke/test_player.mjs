@@ -611,7 +611,7 @@ test('an empty playback queue keeps waiting for a ready song until this browser 
   assert.equal(new LocalPlayback(local.save()).state.playing,false);
 });
 
-test('each new performance resets pitch while pause, seek, refresh and other devices preserve it', () => {
+test('song changes reset pitch while restart, pause, seek, refresh and other devices preserve it', () => {
   const entries=[{...song,status:'completed'},{...song,id:'two',status:'completed'}];
   const local=new LocalPlayback(), other=new LocalPlayback();
   for (const device of [local,other]) {
@@ -633,7 +633,8 @@ test('each new performance resets pitch while pause, seek, refresh and other dev
   local.command('restart',{entry_id:song.id},entries);
   assert.equal(local.state.pitch_semitones,-2); assert.equal(local.state.position,8);
   local.command('restart',{},entries);
-  assert.equal(local.state.pitch_semitones,0); assert.equal(local.state.position,0);
+  assert.equal(local.state.pitch_semitones,-2); assert.equal(local.state.position,0);
+  assert.equal(local.state.levels.lead_vocals,.65);
   assert.equal(local.state.started_at,null); assert.equal(local.state.playing,true);
   local.command('pitch',{pitch_semitones:2},entries);
   local.command('next',{entry_id:'two'},[...entries,{...song,id:'three',status:'completed'}]);
@@ -644,6 +645,41 @@ test('each new performance resets pitch while pause, seek, refresh and other dev
   assert.equal(local.entry.id,'new-request'); assert.equal(local.state.pitch_semitones,0);
   other.reconcile({entries}); assert.equal(other.state.pitch_semitones,3);
 });
+
+for (const playing of [false,true]) {
+  test(`restart keeps sound settings and waits for readiness while ${playing ? 'playing' : 'paused'}`, async () => {
+    const entries=[{...song,status:'completed'}], p=setup();
+    const local=new LocalPlayback({entry:entries[0],position:8,playing,
+      levels:{lead_vocals:.35},pitch_semitones:3});
+    p.pitchFactory=async()=>({input:{},latency:0,setPitch(){},start(){},stop(){}});
+    try {
+      await p.unlock(); await p.load(local.entry,8);
+      if (playing) local.command('ready',{},entries);
+      await p.apply(local.reconcile({entries}),0);
+      for (const muted of [false,true]) {
+        local.command('seek',{position:8},entries);
+        if (muted) local.command('toggle_lead',{},entries);
+        local.command('restart',{entry_id:entries[0].id},entries);
+        await p.apply(local.reconcile({entries}),0);
+        assert.equal(local.state.position,0); assert.equal(local.state.started_at,null);
+        assert.equal(local.state.playing,playing); assert.equal(p.anchor,null);
+        assert.equal(local.state.pitch_semitones,3); assert.equal(p.pitch,3);
+        assert.deepEqual(p.gains.map(g=>g.gain.value),[1,1,muted ? 0 : .35]);
+        assert.equal(local.leadRestore,.35);
+        await p.load(local.entry,0);
+        if (playing) local.command('ready',{},entries);
+        await p.apply(local.reconcile({entries}),0);
+        assert.equal(p.pitch,3); assert.equal(p.gains[2].gain.value,muted ? 0 : .35);
+        assert.equal(p.anchor!==null,playing);
+        const restored=new LocalPlayback(JSON.parse(JSON.stringify(local.save())));
+        restored.reconcile({entries});
+        assert.equal(restored.state.pitch_semitones,3);
+        assert.equal(restored.state.levels.lead_vocals,muted ? 0 : .35);
+        assert.equal(restored.leadRestore,.35);
+      }
+    } finally {p.dispose();}
+  });
+}
 
 test('lead percentage preserves the mix and playback through adjustment, refresh and song changes', async () => {
   const entries=[{...song,status:'completed'}];

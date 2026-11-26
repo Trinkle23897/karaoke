@@ -35,6 +35,8 @@ export KARAOKE_WHISPER_BATCH_SIZE=1  # 仅本地 Whisper 模式使用
 
 需要 `ffmpeg`、`ffprobe` 和 Node.js 22+ 在 PATH 中；严格音频验收及独立 MP3 导出还需要 `lame`。例如 macOS 使用 `brew install ffmpeg lame node`，Debian/Ubuntu 使用 `sudo apt-get install ffmpeg lame libsndfile1` 并安装 Node.js 22+。普通点歌只生成底轨（伴奏＋伴唱）与主唱两轨 FLAC，不调用 LAME；FFmpeg 负责母版解码、公共增益转换与视频编码。YouTube 下载启用 Node.js 执行播放器脚本；`yt-dlp[default]` 同时安装与下载器版本配套的 EJS 组件，不在下载时拉取额外脚本。Node.js 也用于播放器和音频变调测试，前端本身不需要构建。实时升降调的 Signalsmith Stretch / WASM 随源码提供，不需要额外安装、模型下载或运行时 CDN；版本和许可见 `karaoke/dependencies/pitch-shift.json`。
 
+更新代码后也要重新安装 `karaoke/requirements-api.txt`，使运行环境使用项目固定的下载器版本。旧版 yt-dlp 可能因 YouTube 播放器更新而出现 `Signature solving failed`、`n challenge solving failed`，甚至 `a.addOnDisposeCallback is not a function`；遇到这些诊断时先核对 `.venv/bin/python -m yt_dlp --version` 与依赖文件，安装匹配版本后重试原任务。不要仅凭这类错误更换歌曲链接或重新导出 cookies。
+
 主环境负责音频导出、ASR、歌词整理、对齐及字幕渲染。先按硬件安装匹配版本的 PyTorch 与 torchaudio，再装项目依赖。当前 Mac / MPS 开发环境使用 Python 3.12、`torch==2.11.0`、`torchaudio==2.11.0`：
 
 ```sh

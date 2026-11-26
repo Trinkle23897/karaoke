@@ -30,6 +30,8 @@ API 的依赖文件只安装服务依赖。新检出请按[安装说明](../SETU
 
 房间条目的 `lyrics_unavailable` 表示成品没有可显示字幕；`lyrics_need_review` 表示歌词或对齐尚待复核，两者不能混为同一个提示。
 
+普通点歌在歌词查找明确未取得正文、且同一来源的字幕文本回退也未取得歌词时，可返回 `completed`、`validation_scope=playback_without_lyrics`。`cues.json` 与 `lyrics.json.lines` 均为空，`quality.playback_fallback` 记录 `reason=lyrics_not_found`、`subtitle_mode=unavailable` 及原始失败分类，`word_alignment_passed=false`；画面常驻标注「未找到歌词」。跳过歌词对齐与注音，继续原有分离、共同增益、完整解码、文件哈希和视频校验；补视频保留同一提示。已有输入或保存的歌词、对齐错误、查找程序异常和严格音频验收不适用这条回退；不能仅凭空字幕或通用失败状态发布无歌词成品。
+
 | 接口 | 用途 |
 |---|---|
 | `GET /v1/library` | 按来源列出当前任务及已准备／待恢复歌曲，实际文件完整时才标记为已准备 |
@@ -131,7 +133,7 @@ curl -sS http://127.0.0.1:8746/v1/jobs/任务UUID
 
 在线歌词在对齐前检查明显残缺：按拉丁文字的词、其他文字的字计数，少于每十秒一个文本单元时跳过该候选，继续尝试同站其他匹配版本、备用查询和其他来源。重复唱词照常计数，换行数量不影响判断。同一录音的独立来源之间，某份文本不足另一份的一半、且至少 90% 都包含于后者时，也按歌词片段排除。拒绝原因、长度和来源保存在查询与交叉检查诊断中；全部候选被拒绝时标为 `lyrics_incomplete`，不进入对齐、不发布“已准备”。用户明确提供的歌词保持原文，准备阶段继续执行完整性与时间校验。
 
-普通点歌与严格音频验收区分处理。普通点歌先查已发表的歌词文本，核对歌名、歌手与版本，再做声学对齐；该路径的 `validation_scope=playback_lyrics_first`。身份足够明确后，并行查询 LINE MUSIC、LRCLIB、网易云、LyricsWeb 和同一视频的 YouTube Music 歌词；已有视频简介歌词及后续查询到的日文注音歌词页也可作为候选。LRCLIB 候选另做时长检查。正文规范化后至少两个不同来源一致且无同票数冲突时优先采用一致版本，已知同一出版方去重；未达成一致时选用可信来源原文并保留冲突，不拼接歌词。`lyrics_provenance.lyric_lookup.crosscheck` 记录来源和比较结果，`lyric-crosscheck.json` 另保留各份候选文本。结果状态包括 `corroborated`、`conflicting`、`insufficient_sources`，`selection` 记录 `agreement` 或 `published_source`，后两种状态本身不阻止声学对齐。无可靠文本、全曲无可用字幕或仍有输入歌词行缺失时为 hard fail，保留音轨、可用字幕和诊断，不返回可唱成品或“已准备”。输入歌词完整但字词精度需要局部回退时，可返回 `completed`，`validation_scope=playback_with_lyrics_review`，`quality.playback_fallback` 保留错误与字幕模式，`lyrics_provenance.needs_review=true`。各句独立恢复，有效词字保留原时间；失败词组在已有词组起止点或相邻词组／唱句边界之间匀速扫亮。`timing_source=linear_fallback` 仅用于播放，内部记录 `estimated_spans`、`phrase_timing_sources` 和 `omitted_lines`，页面不额外显示估算标记。不能确定合法唱句时间时保留缺行诊断并阻止发布；不因其他行可用就把整首标为已准备。历史 ASR 草稿仅作诊断，不作为回退字幕。音轨分离、文件和完整解码失败仍然阻止发布。`--audio-only` 固定回归继续执行原有完整验收，任何这类回退都不能计为通过。
+普通点歌与严格音频验收区分处理。普通点歌先查已发表的歌词文本，核对歌名、歌手与版本，再做声学对齐；该路径的 `validation_scope=playback_lyrics_first`。身份足够明确后，并行查询 LINE MUSIC、LRCLIB、网易云、LyricsWeb 和同一视频的 YouTube Music 歌词；已有视频简介歌词及后续查询到的日文注音歌词页也可作为候选。LRCLIB 候选另做时长检查。正文规范化后至少两个不同来源一致且无同票数冲突时优先采用一致版本，已知同一出版方去重；未达成一致时选用可信来源原文并保留冲突，不拼接歌词。`lyrics_provenance.lyric_lookup.crosscheck` 记录来源和比较结果，`lyric-crosscheck.json` 另保留各份候选文本。结果状态包括 `corroborated`、`conflicting`、`insufficient_sources`，`selection` 记录 `agreement` 或 `published_source`，后两种状态本身不阻止声学对齐。已找到歌词但全曲无可用字幕或仍有输入歌词行缺失时为 hard fail，保留音轨、可用字幕和诊断，不返回可唱成品或“已准备”。输入歌词完整但字词精度需要局部回退时，可返回 `completed`，`validation_scope=playback_with_lyrics_review`，`quality.playback_fallback` 保留错误与字幕模式，`lyrics_provenance.needs_review=true`。各句独立恢复，有效词字保留原时间；失败词组在已有词组起止点或相邻词组／唱句边界之间匀速扫亮。`timing_source=linear_fallback` 仅用于播放，内部记录 `estimated_spans`、`phrase_timing_sources` 和 `omitted_lines`，页面不额外显示估算标记。不能确定合法唱句时间时保留缺行诊断并阻止发布；不因其他行可用就把整首标为已准备。历史 ASR 草稿仅作诊断，不作为回退字幕。音轨分离、文件和完整解码失败仍然阻止发布。`--audio-only` 固定回归继续执行原有完整验收，任何这类回退都不能计为通过。
 
 多首交错处理时，普通 worker 使用数据目录中的 `stage-locks/` 协调下载、分离、识别／对齐、音轨封装、视频渲染和封装；各类阶段按配置限制并发，不同阶段可交叠。首次下载和补视频共用下载阶段，避免突发请求和同时改写登录文件。`stage_progress.<阶段>.waiting=true` 表示尚未获得执行机会，等待不计入模型运行超时。任务结束或进程退出会释放阶段锁；共享缓存预算保持不变。
 

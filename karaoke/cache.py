@@ -187,6 +187,7 @@ class SongCache:
         audio_complete = job['status'] == 'audio_ready' and can_restore_video(folder, audio, verify_hash=True)
         result = audio if job['status'] == 'audio_ready' and audio else job.get('result') or {}
         keep = {'request.json', 'result.json', 'audio-result.json', 'error.json', 'worker.log', 'lyric-crosscheck.json',
+                'lyrics-first-lookup.json', 'playback-warning.json',
                 'captioned-picture.render.json', 'lyric-readings.json', 'song-language.json', 'song-language-error.json',
                 'song-metadata.json', 'checkpoints/extract_song_metadata.json',
                 'lyrics.json', 'prepared-lyrics.json', 'timing-constraints.json', 'timing-checked/report.json', 'timing-recovery.json',

@@ -1198,7 +1198,7 @@ def prepare_online_lyrics(request, metadata, duration, cache, model, catalog_roo
     if language == 'Chinese' and metadata_language == 'Cantonese' and not request.get('language'):
         language = 'Cantonese'
     if len(lines) > 1000 or any(not line.strip() or len(line) > 200 for line in lines):
-        return None
+        raise ValueError('Found lyric text has invalid line lengths')
     return dict(song, id='song', source_url=request['url'], language=language, lines=lines,
                 provenance=dict(provenance, needs_review=True, route='lyrics_first', independent_asr_coverage=None,
                                 **({'metadata_error': metadata_error} if metadata_error else {})))

@@ -30,6 +30,7 @@ from .cache import can_restore_video
 from .job_schema import (
     JobRequest,
     download_backoff,
+    lyrics_not_found,
     preparation_rank,
     provider_error,
     retry_fields,
@@ -90,6 +91,11 @@ class StageFailure(RuntimeError):
     def __init__(self, stage, message):
         super().__init__(message)
         self.stage = stage
+
+
+class LyricsNotFound(StageFailure):
+    def __init__(self):
+        super().__init__('prepare_lyrics', '未找到可靠的已发表歌词')
 
 
 def processing_error(error, output):
@@ -737,7 +743,9 @@ class Pipeline:
                     self.alignment_outputs.add(self.output/'anchors.json')
                     self.phase(song_info={key: lyrics[key] for key in ('title', 'artist', 'language')})
                     return lyrics
-                raise StageFailure('prepare_lyrics', '未找到可靠的已发表歌词；保留音轨，暂不生成猜测歌词')
+                if not self.request.get('lyrics') and (self.prepared_lyrics or not local_asr.offline()):
+                    raise LyricsNotFound()
+                raise StageFailure('prepare_lyrics', '未取得歌词；请检查歌词输入与查找配置')
             finally:
                 with self.lock:
                     self.timings['prepare_lyrics'] = round(time.perf_counter()-started, 3)
@@ -1303,14 +1311,22 @@ class Pipeline:
                         self.alignment_outputs.add(self.output/'anchors.json')
                         self.phase(song_info={key:lyrics[key] for key in ('title','artist','language')})
                         text_error = None
-            if text_error is None:
+            without_lyrics = isinstance(text_error, LyricsNotFound)
+            if without_lyrics:
+                lyrics = self.without_lyrics(metadata, text_error)
+            elif text_error is None:
                 lyrics = self.resolve_lyric_language(lyrics)
                 lyrics, text_error = self.align_candidates(lyrics, metadata, duration, packaging)
             else:
                 lyrics = self.playback_fallback(metadata, duration, text_error)
                 self.validate_alignment(lyrics, duration, packaging)
+            validation_scope = ('playback_without_lyrics' if without_lyrics else
+                'playback_with_lyrics_review' if text_error is not None else
+                'playback_lyrics_first' if lyrics.get('provenance', {}).get('route') == 'lyrics_first' else
+                'audio_and_lyrics' if self.audio_only else 'full_mv')
             render_info = dict(title=lyrics['title'], artist=lyrics['artist'], language=lyrics['language'],
-                               duration_seconds=duration)
+                duration_seconds=duration, quality=json.loads((self.output/'quality.json').read_text()),
+                validation_scope=validation_scope)
             def prepare_picture():
                 assert video is not None
                 source_metadata = video.result()
@@ -1330,7 +1346,8 @@ class Pipeline:
             duration_seconds=duration, mv_audio=self.request['mv_audio'], shared_preview_gain=stems['preview_shared_gain'],
             source_format=metadata.get('format_id'), artifacts={key: dict(path=value) for key, value in artifacts.items()},
             quality=json.loads((self.output/'quality.json').read_text()),
-            reconstruction=stems['reconstruction']['vocal_first'], device=self.device)
+            reconstruction=stems['reconstruction']['vocal_first'], device=self.device,
+            validation_scope=validation_scope)
         if not self.audio_only:
             self.render_video(result, self.output/'captioned-picture.mp4')
         if compressed is not None:
@@ -1343,10 +1360,7 @@ class Pipeline:
             artifact.update(records[key] if key in records else self.artifact_record(artifact['path']))
         result.update(processing_seconds=round(time.perf_counter()-started, 3), timings=self.timings,
                       stage_timeline=self.timeline,
-                      reused_stages=self.checkpoints.reused,
-                      validation_scope=('playback_with_lyrics_review' if text_error is not None else
-                                        'playback_lyrics_first' if lyrics.get('provenance', {}).get('route') == 'lyrics_first' else
-                                        'audio_and_lyrics' if self.audio_only else 'full_mv'))
+                      reused_stages=self.checkpoints.reused)
         write_json(self.output/('audio-result.json' if self.audio_only else 'result.json'), result)
         return result
 
@@ -1530,6 +1544,27 @@ class Pipeline:
                                        for c in checked for u in c['units'])
         write_json(self.output/'quality.json', quality)
 
+    def without_lyrics(self, metadata, error):
+        """A lookup miss can keep audio playable, but must never discard found text."""
+        saved = self.output/'lyrics.json'
+        if (self.strict_audio or not isinstance(error, LyricsNotFound) or self.request.get('lyrics') or
+                (saved.is_file() and json.loads(saved.read_text()).get('lines'))):
+            raise error
+        song = video_song_info(metadata)
+        song.update({key:self.request[key] for key in ('title', 'artist', 'language') if self.request.get(key)})
+        song.setdefault('language', None)
+        lyrics = dict(song, id='song', lines=[], source_url=self.request['url'],
+                      provenance=dict(kind='unavailable', route='lyrics_first', needs_review=False))
+        warning = dict(reason='lyrics_not_found', error=processing_error(error, self.output),
+                       subtitle_mode='unavailable', word_alignment_passed=False)
+        write_json(saved, lyrics)
+        write_json(self.output/'cues.json', [])
+        write_json(self.output/'playback-warning.json', warning)
+        write_json(self.output/'quality.json', dict(lines=0, units=0, lyrics_provenance=lyrics['provenance'],
+            playback_fallback=warning, onset_accuracy=None, separation_purity=None))
+        self.phase(song_info={key:lyrics[key] for key in ('title', 'artist', 'language')})
+        return lyrics
+
     def playback_fallback(self, metadata, duration, error, *, constraints=()):
         """Keep singing available without presenting unverified word times as valid."""
         from subtitles import playback_units, presentation_cues
@@ -1676,7 +1711,7 @@ class Pipeline:
         return lyrics
 
     def reading_inputs(self, result, subtitles):
-        if result['language'] not in ('Japanese', 'Cantonese'):
+        if lyrics_not_found(result) or result['language'] not in ('Japanese', 'Cantonese'):
             return []
         from .lyric_readings import prepare_readings
         return [prepare_readings([c['text'] for c in json.loads(subtitles.read_text())],
@@ -1689,6 +1724,7 @@ class Pipeline:
         with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings],
                 outputs=[picture, picture.with_suffix('.render.json')],
                 config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
+                        'lyrics_unavailable': lyrics_not_found(result),
                         'implementation': inspect.getsource(type(self).render_picture)},
                 code=[ROOT/p for p in ('render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py', 'lyric_progress.py',
                                       'subtitle_style.py', 'subtitle-styles.json', 'lyric_readings.py')]) as reused:
@@ -1696,6 +1732,7 @@ class Pipeline:
                 write_json(self.output/'song-info.json', dict(title=result['title'], artist=result['artist']))
                 self.run('render', [sys.executable, ROOT/'render_lyric_progress.py', '--video', self.video,
                     '--video-only', '--cues', subtitles, '--song-info', self.output/'song-info.json',
+                    *(['--lyrics-unavailable'] if lyrics_not_found(result) else []),
                     *(['--readings', readings[0]] if readings else []),
                     '--language', {'English': 'Latin'}.get(result['language'], result['language']) or 'auto',
                     '--duration', result['duration_seconds'], '--bottom-margin', '96', '--next-line',
@@ -1712,6 +1749,7 @@ class Pipeline:
                 inputs=[self.video, paths['subtitles'], *readings],
                 outputs=[paths['mv'], presentation],
                 config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
+                    'lyrics_unavailable': lyrics_not_found(result),
                     'implementation': [inspect.getsource(type(self).render_video),
                                        inspect.getsource(type(self).render_uncached)]},
                 code=[ROOT/p for p in ('playback_video.py', 'render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py', 'lyric_progress.py',

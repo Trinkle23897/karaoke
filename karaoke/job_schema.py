@@ -21,6 +21,13 @@ def playback_stems(artifacts):
             ('instrumental', 'backing_vocals', 'lead_vocals'))
 
 
+def lyrics_not_found(result):
+    """Only an explicit lookup miss permits a published empty subtitle timeline."""
+    fallback = result.get('quality', {}).get('playback_fallback', {})
+    return (result.get('validation_scope') == 'playback_without_lyrics' and
+            fallback.get('reason') == 'lyrics_not_found' and fallback.get('subtitle_mode') == 'unavailable')
+
+
 def playback_version(result):
     artifacts = result.get('artifacts', {})
     stems = [(name, artifacts.get(name, {}).get('sha256')) for name in playback_stems(artifacts)]

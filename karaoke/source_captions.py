@@ -137,6 +137,9 @@ def caption_candidate(packet, transcription, language, duration):
 
 def prepare_caption_lyrics(request, metadata, duration, cache, model):
     """Use manual same-recording text only after every omission is confirmed as speech."""
+    from openai import OpenAIError
+
+    from .job_schema import provider_error
     from .lyric_lookup import text_language
     from .song_sources import SongText, extract_song_metadata, video_song_info
     from .vocal_review import review_gaps, speech_intervals
@@ -165,11 +168,16 @@ def prepare_caption_lyrics(request, metadata, duration, cache, model):
     evidence = {key:metadata.get(key) for key in ('title','track','artist','artists','uploader')}
     evidence['caption_lines'] = [dict(number=i+1, text=e['text']) for i,e in enumerate(events)]
     selection = cache.root/'caption-selection.json'
-    with cache.stage('select_caption_lyrics', inputs=[path], outputs=[selection],
-                     config=dict(evidence=evidence, model=model),
-                     code=[Path(__file__), Path(__file__).with_name('song_sources.py')]) as reused:
-        if not reused:
-            selection.write_text(json.dumps(extract_song_metadata(evidence, model), ensure_ascii=False)+'\n')
+    try:
+        with cache.stage('select_caption_lyrics', inputs=[path], outputs=[selection],
+                         config=dict(evidence=evidence, model=model),
+                         code=[Path(__file__), Path(__file__).with_name('song_sources.py')]) as reused:
+            if not reused:
+                selection.write_text(json.dumps(extract_song_metadata(evidence, model), ensure_ascii=False)+'\n')
+    except OpenAIError as error:
+        # This optional source has not supplied lyric text yet. Keep provider
+        # diagnostics without turning a failed selection into invented lyrics.
+        return reject('selection_unavailable', error=provider_error(error) or dict(type=type(error).__name__))
     result = json.loads(selection.read_text()).get('parsed')
     if result is None:
         return reject('invalid_selection')

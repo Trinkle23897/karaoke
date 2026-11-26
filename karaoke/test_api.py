@@ -23,6 +23,7 @@ from karaoke.cache import GIB, CacheFull, can_restore_video
 from karaoke.exact_stems import validate_preview
 from karaoke.job_schema import JobRequest, video_url
 from karaoke.pipeline import (
+    LyricsNotFound,
     Pipeline,
     StageFailure,
     create_poster,
@@ -253,6 +254,39 @@ else:
         after = client.get('/v1/room').json()['entries'][0]
         assert after['id'] == entry['id'] and after['status'] == 'failed'
         assert client.get(f"/v1/jobs/{job['id']}/artifacts/subtitles").status_code == 409
+
+
+@pytest.mark.parametrize('case', ['missing', 'alignment_failure', 'found_text', 'unclassified', 'damaged_audio'])
+def test_only_explicit_lyric_lookup_miss_publishes_without_subtitles(tmp_path, case):
+    def worker(folder):
+        after = """r=json.loads((p/'result.json').read_text()); case=sys.argv[2]
+(p/'cues.json').write_text('[]')
+r['artifacts']['subtitles'].update(bytes=2,sha256=hashlib.sha256(b'[]').hexdigest())
+(p/'lyrics.json').write_text(json.dumps({'lines':['Found words'] if case=='found_text' else []}))
+r.update(validation_scope='playback_without_lyrics',quality={
+    'lyrics_provenance':{'needs_review':False},'playback_fallback':{
+    'reason':'align_words_failed' if case=='alignment_failure' else 'lyrics_not_found','subtitle_mode':'unavailable'}})
+(p/'lyrics-first-lookup.json').write_text(json.dumps({'status':'no_matching_published_text'}))
+(p/'playback-warning.json').write_text(json.dumps(r['quality']['playback_fallback']))
+if case=='unclassified': r.pop('validation_scope')
+if case=='damaged_audio': (p/'lead.wav').write_bytes(b'damaged')
+(p/'result.json').write_text(json.dumps(r))
+"""
+        return fake_worker(folder, after=after, args=(case,))
+    app = create_app(tmp_path, worker_command=worker, version='test')
+    with TestClient(app) as client:
+        entry = client.post('/v1/room/entries', json={'url':URL}).json()['entries'][0]
+        job = finished(client, entry['job_id'])
+        assert job['status'] == ('completed' if case == 'missing' else 'failed')
+        song = client.get('/v1/room').json()['entries'][0]
+        if case == 'missing':
+            assert song['lyrics_unavailable'] and not song['lyrics_need_review']
+            assert client.get(song['artifacts']['subtitles']).json() == []
+            assert client.get(song['artifacts']['mv'], headers={'Range':'bytes=0-127'}).status_code == 206
+            assert json.loads((tmp_path/job['id']/'lyrics-first-lookup.json').read_text())['status'] == 'no_matching_published_text'
+            assert json.loads((tmp_path/job['id']/'playback-warning.json').read_text())['reason'] == 'lyrics_not_found'
+        else:
+            assert job['error']['code'] == 'worker_error' and not song['artifacts']
 
 
 @pytest.mark.parametrize('rate,playback_rate', [(16000,48000), (44100,48000), (48000,44100)])
@@ -1202,7 +1236,7 @@ def test_manual_caption_failure_obeys_backoff_and_keeps_cached_diagnostics(tmp_p
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize('verdict', ['speech', 'singing', 'uncertain', 'invalid_selection', 'overlap', 'automatic'])
+@pytest.mark.parametrize('verdict', ['speech', 'singing', 'uncertain', 'invalid_selection', 'overlap', 'automatic', 'metadata_unavailable'])
 def test_playback_caption_lyrics_keep_all_singing_and_review_omitted_dialogue(tmp_path, monkeypatch, verdict):
     import soundfile as sf
 
@@ -1224,6 +1258,9 @@ def test_playback_caption_lyrics_keep_all_singing_and_review_omitted_dialogue(tm
     calls = []
     def extract(evidence, model):
         calls.append(evidence)
+        if verdict == 'metadata_unavailable':
+            from openai import OpenAIError
+            raise OpenAIError('private configuration details')
         return dict(parsed=dict(title='風の歌', artist='二人',
                     lyric_line_numbers=[3,2] if verdict == 'invalid_selection' else [2,3]))
     monkeypatch.setattr(song_sources, 'extract_song_metadata', extract)
@@ -1251,7 +1288,11 @@ def test_playback_caption_lyrics_keep_all_singing_and_review_omitted_dialogue(tm
         assert result is None
         if verdict != 'automatic':
             report = json.loads((tmp_path/'caption-lyrics-review.json').read_text())
-            assert report['status'] == {'invalid_selection':'invalid_selection','overlap':'unreviewable_omission'}.get(verdict,'unverified_omission')
+            assert report['status'] == {'invalid_selection':'invalid_selection','overlap':'unreviewable_omission',
+                                       'metadata_unavailable':'selection_unavailable'}.get(verdict,'unverified_omission')
+            if verdict == 'metadata_unavailable':
+                assert report['error'] == {'type':'OpenAIError'}
+                assert not (tmp_path/'caption-selection.json').exists()
 
 
 @pytest.mark.parametrize('padded', [False, True])
@@ -6144,7 +6185,7 @@ def test_download_selects_720p_without_reducing_audio_quality(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize('mode', ['full', 'audio', 'playback_audio'])
-@pytest.mark.parametrize('failure', ['transcribe', 'prepare_lyrics', 'align_words', 'align_phonemes', 'no_subtitles', 'separate_lead', 'package_three_stems', 'validate_timing', 'overlap', 'dependency_overlap', 'render_overlap', 'video_overlap', 'compression_overlap'])
+@pytest.mark.parametrize('failure', ['lyrics_not_found', 'previous_lyrics', 'supplied_lyrics', 'transcribe', 'prepare_lyrics', 'align_words', 'align_phonemes', 'no_subtitles', 'separate_lead', 'package_three_stems', 'validate_timing', 'overlap', 'dependency_overlap', 'render_overlap', 'video_overlap', 'compression_overlap'])
 def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(tmp_path, monkeypatch, mode, failure):
     import soundfile as sf
     audio_only, strict = mode != 'full', mode == 'audio'
@@ -6161,6 +6202,10 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
         preview_shared_gain=.8, reconstruction=dict(vocal_first={'verified': True}))))
     lyrics = dict(title='Example', artist='Singer', language='English', lines=['A little song'], provenance={})
     (tmp_path/'lyrics.json').write_text(json.dumps(lyrics))
+    if failure in ('lyrics_not_found', 'supplied_lyrics'):
+        (tmp_path/'lyrics.json').unlink()
+    if failure == 'supplied_lyrics':
+        pipeline.request['lyrics'] = lyrics['lines']
     (tmp_path/'source.json').write_text(json.dumps(dict(audio_only=failure == 'video_overlap')))
     (tmp_path/'poster.jpg').write_bytes(b'poster fixture')
     (tmp_path/'alignment').mkdir()
@@ -6201,6 +6246,8 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
     monkeypatch.setattr(pipeline, 'run', run)
     def prepare(*args):
         lyrics_started.set()
+        if failure in ('lyrics_not_found', 'previous_lyrics', 'supplied_lyrics'):
+            raise LyricsNotFound()
         if failure == 'dependency_overlap':
             assert packaged.wait(5), 'Stem packaging waited for independent lyric lookup'
         fail('transcribe')
@@ -6236,7 +6283,7 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
         if failure == 'dependency_overlap':
             assert sf.info(tmp_path/'vocals-16k.wav').samplerate == 16000
             assert (tmp_path/'vocals-asr.mp3').exists() == strict
-    elif strict or failure in ('separate_lead', 'package_three_stems', 'no_subtitles', 'validate_timing'):
+    elif strict or failure in ('previous_lyrics', 'supplied_lyrics', 'separate_lead', 'package_three_stems', 'no_subtitles', 'validate_timing'):
         with pytest.raises(StageFailure) as caught:
             pipeline.execute()
         assert not (tmp_path/'result.json').exists()
@@ -6246,8 +6293,26 @@ def test_playback_survives_text_failure_but_audio_and_acceptance_remain_strict(t
             assert not (tmp_path/'mv.mp4').exists()
             assert (tmp_path/'stems/lead.wav').is_file()
             assert json.loads((tmp_path/'playback-warning.json').read_text())['omitted_lines'] == [1]
+        elif failure in ('lyrics_not_found', 'previous_lyrics', 'supplied_lyrics'):
+            assert isinstance(caught.value, LyricsNotFound)
         else:
             assert str(caught.value) == 'fixture failure'
+    elif failure == 'lyrics_not_found':
+        from karaoke.api import validated_result
+        result = pipeline.execute()
+        assert result['validation_scope'] == 'playback_without_lyrics'
+        assert result['quality']['playback_fallback']['reason'] == 'lyrics_not_found'
+        assert result['quality']['playback_fallback']['subtitle_mode'] == 'unavailable'
+        assert not result['quality']['lyrics_provenance']['needs_review']
+        assert json.loads((tmp_path/'cues.json').read_text()) == []
+        assert json.loads((tmp_path/'lyrics.json').read_text())['lines'] == []
+        assert not alignment_started.is_set() and validated == []
+        assert set(result['artifacts']) >= {'accompaniment', 'lead_vocals', 'subtitles'}
+        if not audio_only:
+            assert validated_result(tmp_path)['validation_scope'] == 'playback_without_lyrics'
+            (tmp_path/'lyrics.json').write_text(json.dumps(lyrics))
+            with pytest.raises(ValueError, match='must not omit found text'):
+                validated_result(tmp_path)
     else:
         result = pipeline.execute()
         assert result['validation_scope'] == 'playback_with_lyrics_review'
@@ -6324,6 +6389,22 @@ def test_normal_preparation_reuses_bound_lyrics_and_refetches_stale_cache(tmp_pa
     assert actual == (fresh if change else lyrics)
     assert fetch.call_count == int(change is not None)
     assert read_prepared_lyrics(cached,URL,metadata) == actual
+
+
+@pytest.mark.parametrize('outcome', ['missing', 'invalid', 'network', 'offline', 'supplied'])
+def test_missing_lyrics_is_distinct_from_lookup_and_input_failures(tmp_path, monkeypatch, outcome):
+    request: dict[str, Any] = dict(url=URL)
+    if outcome == 'supplied':
+        request['lyrics'] = ['Already supplied words']
+    error = ValueError('Invalid found text') if outcome == 'invalid' else RuntimeError('Network failed')
+    lookup = Mock(side_effect=error) if outcome in ('invalid', 'network') else Mock(return_value=None)
+    monkeypatch.setattr('karaoke.lyric_lookup.prepare_online_lyrics', lookup)
+    monkeypatch.setattr('karaoke.pipeline.local_asr.offline', lambda:outcome == 'offline')
+    with pytest.raises((StageFailure, ValueError, RuntimeError)) as caught:
+        Pipeline(request, tmp_path).prepare_text({}, 10)
+    assert isinstance(caught.value, LyricsNotFound) == (outcome == 'missing')
+    assert not (tmp_path/'cues.json').exists()
+    assert lookup.call_count == int(outcome != 'offline')
 
 
 @pytest.mark.parametrize('mode', ['success', 'other_recording', 'all_fail', 'resource_failure', 'stale', 'supplied', 'soft',
@@ -7542,6 +7623,32 @@ def test_auxiliary_intro_and_long_preview_cannot_abort_valid_lyric_video(tmp_pat
     assert json.loads((tmp_path/'cues.json').read_text()) == cues
 
 
+def test_missing_lyrics_notice_is_visible_throughout_video_without_lyric_times(tmp_path, monkeypatch):
+    import karaoke.render_lyric_progress as renderer
+    source, output, cues = tmp_path/'source.mp4', tmp_path/'output.mp4', tmp_path/'cues.json'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=25:d=0.4',
+        '-c:v', 'libx264', str(source)], check=True)
+    cues.write_text('[]')
+    argv = ['render', '--video', str(source), '--video-only', '--cues', str(cues),
+        '--lyrics-unavailable', '--language', 'Japanese', '--duration', '0.4', '--output', str(output)]
+    monkeypatch.setattr(sys, 'argv', argv)
+    renderer.main()
+    report = json.loads(output.with_suffix('.render.json').read_text())
+    assert report['shown_lines'] == [] and report['countdown']['events'] == []
+    assert report['furigana'] == {} and json.loads(cues.read_text()) == []
+    frames = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output),
+        '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'])
+    frames = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 720, 1280, 3)
+    for frame in (frames[0], frames[-1]):
+        region = frame[350:650, 300:980].astype(int)
+        white = (region.min(axis=2) > 150) & (np.ptp(region, axis=2) < 30)
+        assert white.sum() > 500, 'Missing persistent text in the encoded video'
+    cues.write_text(json.dumps([dict(text='Found lyrics', start=0, end=.4, units=[])]))
+    monkeypatch.setattr(sys, 'argv', [*argv[:-1], str(tmp_path/'invalid.mp4')])
+    with pytest.raises(ValueError, match='cannot replace found subtitles'):
+        renderer.main()
+
+
 @pytest.mark.parametrize('second_start,first_end', [(0., .1), (-.1, .1), (.2, 0.)])
 def test_lyric_renderer_rejects_unordered_or_empty_intervals(tmp_path, monkeypatch, second_start, first_end):
     import karaoke.render_lyric_progress as renderer
@@ -8365,6 +8472,21 @@ def test_audio_pipeline_runs_separation_and_alignment_but_cannot_claim_a_full_mv
     for policy in (True, False):
         with pytest.raises(ValueError, match='No usable subtitles'):
             verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=policy)
+    # Empty captions are allowed only for a recorded lookup miss in playback;
+    # they must still fail strict acceptance and cannot hide existing words.
+    result['validation_scope'] = 'playback_without_lyrics'
+    result['quality']['playback_fallback']['reason'] = 'lyrics_not_found'
+    (folder/'audio-result.json').write_text(json.dumps(result))
+    with pytest.raises(ValueError, match='omit supplied lyric text'):
+        verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=True)
+    (folder/'lyrics.json').write_text(json.dumps(dict(lines=[])))
+    missing = verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True, playback_policy=True)
+    assert missing['validation_scope'] == 'playback_without_lyrics'
+    assert missing['subtitle_lines'] == missing['subtitle_units'] == 0
+    with pytest.raises(ValueError, match='No usable subtitles'):
+        verify_outputs(None, '', tmp_path, {'id':'job'}, audio_only=True)
+    result['validation_scope'] = 'audio_and_lyrics'
+    (folder/'lyrics.json').write_text(json.dumps(dict(lines=['Hello'])))
     result['quality'].pop('playback_fallback')
     subtitle_path.write_text(json.dumps([dict(text='Hello world', start=.1, end=.12,
         units=[dict(text='Hello world', first=0, stop=11, start=.1, end=.12)])]))

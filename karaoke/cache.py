@@ -151,14 +151,17 @@ class SongCache:
             sizes.update(file_sizes(folder))
         return sum(sizes.values())
 
+    @staticmethod
+    def room_state(db):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='room'").fetchone():
+            return json.loads(db.execute('SELECT state FROM room WHERE id=1').fetchone()[0])
+        return {}
+
     def protected(self, jobs):
         ids = {j['id'] for j in jobs if j['status'] in ('queued', 'running')}
         ids.update(self.leases)
         with self.store.connect() as db:
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='room'").fetchone():
-                import json
-                state = json.loads(db.execute('SELECT state FROM room WHERE id=1').fetchone()[0])
-                ids.update(e['job_id'] for e in state['entries'])
+            ids.update(e['job_id'] for e in self.room_state(db).get('entries', []))
         return ids
 
     def source_files(self, job):
@@ -221,7 +224,7 @@ class SongCache:
             if (folder/'source.json').is_file():
                 keep.update({'source.json', 'download/source.mkv', 'download/source.info.json', 'poster.jpg'})
         keep.update(a['path'] for name, a in result.get('artifacts', {}).items()
-                    if name != 'mv' or not job.get('restore_video'))
+                    if name != 'mv' or not job.get('restore_video') or valid_artifact(folder, a, verify_hash=True))
         if source_only:
             keep = self.source_files(job)
             if not keep:

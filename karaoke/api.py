@@ -267,12 +267,52 @@ class Store:
             if len(self.access_times) > 1024:
                 self.access_times.popitem(last=False)
 
-    def requeue(self, db, doc, key, version):
+    def queue_stale_video(self, db, doc):
+        """Upgrade a requested MV once, under the caller's write transaction."""
+        from .pipeline import video_render_key
+        job_id = doc['id']
+        result = doc.get('result') or {}
+        mv = result.get('artifacts', {}).get('mv')
+        if not mv or self.cache.leases[job_id]:
+            return False
+        folder = self.cache.folder(job_id)
+        if valid_artifact(folder, mv, verify_hash=False):
+            try:
+                if mv.get('render_key') == video_render_key():
+                    return False
+            except OSError as error:
+                logging.getLogger(__name__).warning('Job %s: keeping cached MV, renderer unavailable: %s', job_id, error)
+                return False
+        if not can_restore_video(folder, result):
+            return False
+        try:
+            JobRequest.model_validate(doc['input'])
+        except ValueError:
+            return False  # A retired source can still have a playable cached MV.
+        # Modern players hold leases. An older room can also be playing
+        # without an events connection.
+        state = self.cache.room_state(db)
+        if state.get('playing') and any(e['id'] == state['current_id'] and e['job_id'] == job_id
+                                        for e in state['entries']):
+            return False
+        doc['restore_video'] = True
+        self.requeue(db, doc, doc.get('pipeline_version'))
+        return True
+
+    def refresh_video(self, job_id):
+        """Requeue the selected recording, even if newer attempts exist."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT doc FROM jobs WHERE id=? AND status='completed'", (job_id,)).fetchone()
+            return bool(row and self.queue_stale_video(db, json.loads(row[0])))
+
+    def requeue(self, db, doc, version):
         folder = self.cache.folder(doc['id'])
         folder.mkdir(exist_ok=True)
         (folder/'request.json').write_text(json.dumps(doc['input'], ensure_ascii=False)+'\n')
         if not doc.get('restore_video'):
             doc['pipeline_version'] = version
+            db.execute('UPDATE jobs SET cache_key=? WHERE id=?', (job_cache_key(doc['input'], version), doc['id']))
         if not doc.get('restore_video') or doc['status'] == 'failed':
             doc['attempt_count'] = doc.get('attempt_count', 1)+1
         if doc.get('download_retry'):
@@ -280,8 +320,8 @@ class Store:
         stamp = now()
         doc.update(status='queued', active_stages=[], stage_progress={}, timings={}, error=None,
                    updated_at=stamp, last_accessed_at=stamp)
-        db.execute('UPDATE jobs SET cache_key=?, status=?, doc=? WHERE id=?',
-                   (key, 'queued', json.dumps(doc, ensure_ascii=False), doc['id']))
+        db.execute('UPDATE jobs SET status=?, doc=? WHERE id=?',
+                   ('queued', json.dumps(doc, ensure_ascii=False), doc['id']))
         return doc
 
     def retry(self, job_id, version):
@@ -293,7 +333,7 @@ class Store:
             doc = json.loads(row[0])
             if doc.get('restore_video') and not can_restore_video(self.cache.folder(job_id), doc.get('result')):
                 raise HTTPException(409, '保留的音轨或字幕不完整，无法补回视频')
-            return self.requeue(db, doc, job_cache_key(doc['input'], version), version)
+            return self.requeue(db, doc, version)
 
     def create(self, payload, version):
         key_payload = payload.model_dump(exclude={'force'})
@@ -304,7 +344,8 @@ class Store:
                 rows = db.execute("""SELECT doc FROM jobs WHERE json_extract(doc, '$.input.url')=? AND (
                     (cache_key=? AND status='running') OR status IN ('queued','failed','cancelled','audio_ready','source_ready','completed')
                     OR json_extract(doc, '$.restore_video')=1)
-                    ORDER BY (cache_key=?) DESC, (status='completed') DESC,
+                    ORDER BY (status IN ('queued','running') AND json_extract(doc, '$.restore_video') IS 1) DESC,
+                             (cache_key=?) DESC, (status='completed') DESC,
                              COALESCE(json_extract(doc, '$.restore_video'), 0) DESC, created_at DESC""", (payload.url, key, key))
                 for row in rows:
                     doc = json.loads(row[0])
@@ -329,13 +370,15 @@ class Store:
                         if (not source_ready and doc['status'] != 'cancelled'
                                 and not any((folder/'checkpoints').glob('*.json'))):
                             continue
-                        return self.requeue(db, doc, key, version), False
+                        return self.requeue(db, doc, version), False
                     if doc.get('restore_video'):
                         if doc['status'] not in ('queued', 'running'):
                             folder = self.root/doc['id']
                             if not can_restore_video(folder, doc.get('result')):
                                 continue
-                            return self.requeue(db, doc, key, version), False
+                            return self.requeue(db, doc, version), False
+                    if doc['status'] == 'completed' and self.queue_stale_video(db, doc):
+                        return doc, False
                     if doc['status'] != 'completed' or all(
                             (self.root/doc['id']/item['path']).is_file()
                             for name, item in doc['result']['artifacts'].items() if name != 'poster'):
@@ -758,8 +801,11 @@ def create_app(data_dir=None, *, worker_command=None, version=None, cache_limit_
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise RuntimeError('此任务目录已有服务在运行。每个 GPU 队列只运行一个 API worker。') from error
+            order = room.preparation_order(room.read())
+            for job_id in dict.fromkeys(order):
+                store.refresh_video(job_id)
             await worker.start()
-            worker.prioritize(room.preparation_order(room.read()))
+            worker.prioritize(order)
             try:
                 yield
             finally:

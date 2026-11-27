@@ -340,12 +340,16 @@ class Room:
                 song.update(status='evicted', poster=None)
         return songs
 
+    def refresh_video(self, job):
+        if job['status'] != 'completed' or not self.store.refresh_video(job['id']):
+            return False
+        self.worker.queue.put_nowait(job['id'])
+        return True
+
     def add(self, request):
         if bool(request.url) == bool(request.job_id):
             raise HTTPException(422, '请提供视频链接或已准备好的歌曲')
-        replay = bool(request.job_id) and not request.force
         state = self.read()
-        existing = None
         if request.if_absent:
             if request.job_id:
                 requested = self.store.read(request.job_id)
@@ -358,17 +362,16 @@ class Room:
             for entry in state['entries']:
                 job = self.store.read(entry['job_id'])
                 if job and job['input']['url'] == url:
-                    if replay or job['status'] != 'completed' or job.get('pipeline_version') == self.version or entry['id'] == state['current_id']:
-                        return self.snapshot()
-                    existing = entry
-                    request = request.model_copy(update={'url': None, 'job_id': job['id']})
-                    break
+                    if self.refresh_video(job):
+                        self.worker.prioritize(self.preparation_order(state))
+                        self.updates.publish()
+                    return self.snapshot()
         if request.job_id:
             job = self.store.read(request.job_id)
             missing = job and lyrics_unavailable(job.get('result'))
-            if job and (request.force or missing or job['status'] in ('evicted', 'video_evicted', 'cancelled', 'audio_ready', 'source_ready') or job.get('restore_video') or
-                        (not replay and job['status'] == 'completed' and job.get('pipeline_version') != self.version)):
-                version = job['pipeline_version'] if replay and job.get('restore_video') and not missing else self.version
+            if job and (request.force or missing or job['status'] in ('evicted', 'video_evicted', 'cancelled', 'audio_ready', 'source_ready')
+                        or (job['status'] == 'failed' and job.get('restore_video'))):
+                version = job['pipeline_version'] if job.get('restore_video') and not request.force and not missing else self.version
                 try:
                     payload = JobRequest(**{**job['input'], 'force': request.force})
                 except ValueError as error:
@@ -378,9 +381,10 @@ class Room:
                     self.worker.queue.put_nowait(job['id'])
             elif not job or job['status'] not in ('completed', 'queued', 'running'):
                 raise HTTPException(404, '这首歌的任务已不可用，请重新提交链接')
-            if job['status'] == 'completed' and not all((self.store.root/job['id']/a['path']).is_file()
-                       for name, a in job['result']['artifacts'].items() if name != 'poster'):
-                raise HTTPException(409, '这首歌的文件已不可用，请重新提交链接')
+            elif job['status'] == 'completed' and not self.refresh_video(job):
+                if not all((self.store.root/job['id']/a['path']).is_file()
+                           for name, a in job['result']['artifacts'].items() if name != 'poster'):
+                    raise HTTPException(409, '这首歌的文件已不可用，请重新提交链接')
         else:
             try:
                 payload = JobRequest(url=request.url, title=request.title, force=request.force)
@@ -393,10 +397,7 @@ class Room:
                 self.worker.queue.put_nowait(job['id'])
         if thumbnail_url(request.source_thumbnail) and not (job.get('song_info') or {}).get('thumbnail'):
             job = self.store.update(job['id'], song_info={'thumbnail': request.source_thumbnail})
-        if existing is None:
-            state['entries'].append(dict(id=str(uuid4()), job_id=job['id']))
-        else:
-            existing['job_id'] = job['id']
+        state['entries'].append(dict(id=str(uuid4()), job_id=job['id']))
         self.store.touch(job['id'])
         self.save(state)
         return self.snapshot()

@@ -1,8 +1,6 @@
 """Shared, transparent subtitle typography for previews and exported videos."""
 
 import io
-import json
-import os
 import re
 import subprocess
 import time
@@ -14,7 +12,12 @@ from typing import Any
 from fontTools.ttLib import TTFont, TTLibError
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFilter, ImageFont
 
-TOKENS = json.loads(Path(__file__).with_name('subtitle-styles.json').read_text())
+if __package__:
+    from .subtitle_config import font_files, load_styles
+else:
+    from subtitle_config import font_files, load_styles
+
+TOKENS = load_styles()
 STYLES = TOKENS['styles']
 DEFAULT_STYLE = TOKENS['default_style']
 KANJI = r'[\u3400-\u9fff\uf900-\ufaff\U00020000-\U0002ffff々〆]+'
@@ -293,15 +296,7 @@ def coverage(path, index):
 
 
 def font_inputs(style=DEFAULT_STYLE, font_file=None):
-    """Files shared by font selection and render checkpoints, in priority order."""
-    override = font_file or os.getenv('KARAOKE_FONT_FILE')
-    paths = [Path(override).resolve()] if override else []
-    asset = STYLES[style].get('font_asset')
-    if asset:
-        path = (Path(__file__).parent/'models'/'fonts'/asset).resolve()
-        if path.is_file() and path not in paths:
-            paths.append(path)
-    return paths
+    return font_files(STYLES[style], font_file)
 
 
 def resolve_font(text, style=DEFAULT_STYLE, language='auto', font_file=None):

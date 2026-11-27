@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
 from io import BufferedReader
 from pathlib import Path
 from typing import Any, cast
@@ -46,6 +47,7 @@ from .song_sources import (
 )
 from .stage_cache import StageCache
 from .stage_progress import parse_progress
+from .subtitle_config import font_files, load_styles
 
 
 def write_json(path, value):
@@ -84,6 +86,36 @@ def pipeline_fingerprint():
     for path in sorted((ROOT/'lyrics').glob('*.json')):
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def video_render_key():
+    """Identify the picture and mux independently of audio models and alignment."""
+    settings = load_styles()
+    name = settings['default_style']
+    style = settings['styles'][name]
+    settings['styles'] = {name: style}
+    files = [ROOT/name for name in ('render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py',
+        'lyric_progress.py', 'subtitle_style.py', 'subtitle_config.py', 'lyric_readings.py', 'playback_video.py')]
+    stamps = []
+    for path in (*files, *font_files(style)):
+        stat = path.stat()
+        stamps.append((path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    return _video_render_key(json.dumps(settings, sort_keys=True), tuple(stamps))
+
+
+@lru_cache(maxsize=4)
+def _video_render_key(settings, stamps):
+    # Detect font replacements without hashing large files on every request.
+    # Only names and contents enter the published key, never local timestamps.
+    inputs = [(path.name, file_hash(path)) for path, *_ in stamps]
+    code = [inspect.getsource(method) for method in
+            (Pipeline.reading_inputs, Pipeline.render_picture, Pipeline.render_video, Pipeline.render_uncached)]
+    return hashlib.sha256(json.dumps([settings, inputs, code]).encode()).hexdigest()
+
+
+def render_config(result):
+    return {**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
+            'render_key': video_render_key()}
 
 
 class StageFailure(RuntimeError):
@@ -1692,16 +1724,11 @@ class Pipeline:
                                  self.request['url'], self.checkpoints, result['language'])]
 
     def render_picture(self, result):
-        from .subtitle_style import font_inputs
         subtitles = self.output/result.get('artifacts', {}).get('subtitles', {}).get('path', 'cues.json')
         readings = self.reading_inputs(result, subtitles)
         picture = self.output/'captioned-picture.mp4'
-        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings, *font_inputs()],
-                outputs=[picture, picture.with_suffix('.render.json')],
-                config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
-                        'implementation': inspect.getsource(type(self).render_picture)},
-                code=[ROOT/p for p in ('render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py', 'lyric_progress.py',
-                                      'subtitle_style.py', 'subtitle-styles.json', 'lyric_readings.py')]) as reused:
+        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings],
+                outputs=[picture, picture.with_suffix('.render.json')], config=render_config(result)) as reused:
             if not reused:
                 write_json(self.output/'song-info.json', dict(title=result['title'], artist=result['artist']))
                 self.run('render', [sys.executable, ROOT/'render_lyric_progress.py', '--video', self.video,
@@ -1713,20 +1740,14 @@ class Pipeline:
         return picture
 
     def render_video(self, result, picture=None):
-        from .subtitle_style import font_inputs
         paths = {name: self.output/a['path'] for name, a in result['artifacts'].items()}
         readings = self.reading_inputs(result, paths['subtitles'])
         presentation = paths['mv'].with_suffix('.presentation.json')
+        config = render_config(result)
         result.pop('video_only', None)
         result['video_audio'] = 'silent_aac'
-        with self.checkpoints.stage('render',
-                inputs=[self.video, paths['subtitles'], *readings, *font_inputs()],
-                outputs=[paths['mv'], presentation],
-                config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
-                    'implementation': [inspect.getsource(type(self).render_video),
-                                       inspect.getsource(type(self).render_uncached)]},
-                code=[ROOT/p for p in ('playback_video.py', 'render_lyric_progress.py', 'render_subtitles.py', 'subtitles.py', 'lyric_progress.py',
-                                      'subtitle_style.py', 'subtitle-styles.json', 'lyric_readings.py')]) as reused:
+        with self.checkpoints.stage('render', inputs=[self.video, paths['subtitles'], *readings],
+                outputs=[paths['mv'], presentation], config=config) as reused:
             if not reused:
                 self.render_uncached(result, picture)
                 rendered = picture if picture is not None else self.output/'captioned-picture.mp4'
@@ -1734,6 +1755,7 @@ class Pipeline:
                 write_json(presentation, dict(countdown_events=report['countdown']['events'],
                                               opening_countdown=report['opening_countdown']))
         result.setdefault('quality', {}).update(json.loads(presentation.read_text()))
+        result['artifacts']['mv']['render_key'] = config['render_key']
 
     def render_uncached(self, result, picture=None):
         picture = picture if picture is not None else self.render_picture(result)
@@ -1748,7 +1770,7 @@ class Pipeline:
         picture.unlink()
 
     def restore_video(self):
-        """Rebuild only the discarded video; never run a model or change cached audio/cues."""
+        """Rebuild only the video; never run a model or change cached audio/cues."""
         from .exact_stems import decode_source, pcm_sha
         started = time.perf_counter()
         result = json.loads((self.output/'result.json').read_text())
@@ -1765,8 +1787,12 @@ class Pipeline:
         finally:
             self.timings['verify_video'] = round(time.perf_counter()-verified, 3)
             self.phase('verify_video', False)
-        self.render_video(result)
         artifact = result['artifacts']['mv']
+        if (self.output/artifact['path']).is_file():
+            # StageCache unlinks stale outputs. Keep the published file until
+            # the worker has verified and committed its replacement.
+            artifact['path'] = 'mv-refreshed.mp4' if artifact['path'] == 'mv.mp4' else 'mv.mp4'
+        self.render_video(result)
         path = self.output/artifact['path']
         artifact.update(bytes=path.stat().st_size, sha256=file_hash(path))
         result['video_restore'] = dict(processing_seconds=round(time.perf_counter()-started, 3), timings=self.timings)

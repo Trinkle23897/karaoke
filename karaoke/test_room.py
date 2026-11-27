@@ -728,7 +728,11 @@ def test_replaying_completed_song_keeps_media_by_id_or_url_across_versions(tmp_p
 
 def test_refresh_does_not_replace_current_or_leased_media(tmp_path):
     app = create_app(tmp_path, version='new')
-    old = ready_job(app.state.store)
+    store = app.state.store
+    old, leased = [cache_fixture(store, suffix, restorable=True) for suffix in ('1', '2')]
+    for job in (old, leased):
+        del job['result']['artifacts']['mv']['render_key']
+        store.update(job['id'], result=job['result'])
     state = app.state.room.read()
     state.update(entries=[dict(id='current',job_id=old['id'])],current_id='current',playing=True,position=4,started_at=time.time())
     app.state.room.save(state)
@@ -738,10 +742,13 @@ def test_refresh_does_not_replace_current_or_leased_media(tmp_path):
     assert second['entries'][0]['job_id']==second['entries'][1]['job_id']==old['id']
     assert app.state.store.read(old['id'])['status']=='completed'
     assert second['current_id']=='current' and second['playing']
-    leased = ready_job(app.state.store,url='https://www.youtube.com/watch?v=2Vv-BfVoq4g')
-    app.state.store.cache.acquire(leased['id'])
-    fresh,_ = app.state.store.create(JobRequest(url=leased['input']['url']),'new')
-    assert fresh['id']==leased['id'] and app.state.store.read(leased['id'])['status']=='completed'
+    request = JobRequest.model_validate({**leased['input'], 'force':False})
+    store.cache.acquire(leased['id'])
+    fresh, hit = store.create(request, 'new')
+    assert hit and fresh['id'] == leased['id'] and fresh['status'] == 'completed'
+    store.cache.release(leased['id'])
+    fresh, hit = store.create(request, 'new')
+    assert not hit and fresh['id'] == leased['id'] and fresh['restore_video']
 
 
 def test_wait_for_preparation_then_play_pause_seek_mix_and_persist(tmp_path):

@@ -64,7 +64,8 @@ def migrate(store, job):
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
-        updated['artifacts']['mv'] = dict(path=target.name, bytes=target.stat().st_size, sha256=sha(target))
+        updated['artifacts']['mv'] = dict(original['artifacts']['mv'], path=target.name,
+                                          bytes=target.stat().st_size, sha256=sha(target))
         updated.pop('video_only', None)
         updated['video_audio'] = 'silent_aac'
     save(folder/'storage-migration.json', evidence)

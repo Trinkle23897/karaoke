@@ -71,7 +71,7 @@ curl -fL "$font_url/SIL_Open_Font_License_1.1.txt" -o karaoke/models/fonts/SIL_O
 echo '907dfeb5fd0f38d89fd970c170f878d14169d66c1f30d8b08b16510c80651648  karaoke/models/fonts/GenSenRounded2-M.ttc' | shasum -a 256 -c -
 ```
 
-默认按歌曲语言选字形。要换字体，用 `KARAOKE_FONT_FILE` 指定文件路径。缺字时会尝试系统字体，实际使用的字体名见渲染报告。更换字体后，新生成的 MV 会用新字形。
+默认按歌曲语言选字形。要换字体，用 `KARAOKE_FONT_FILE` 指定文件路径。缺字时会尝试系统字体，实际使用的字体名见渲染报告。换字体并重启后，待唱歌曲会自动重绘 MV，曲库里其他歌曲下次点播时更新。
 
 ## 3. 对齐器源码
 

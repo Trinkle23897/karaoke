@@ -8109,6 +8109,48 @@ def test_unavailable_published_readings_do_not_fail_valid_lyrics(tmp_path, monke
     assert readings.resolve_readings(lines[0])[0] == ((0, 2, 'きょう'), (3, 4, 'そら'))
 
 
+def test_japanese_recording_readings_are_local_to_one_sung_occurrence(tmp_path):
+    from karaoke.lyric_readings import load_readings, resolve_readings
+    text = 'まだ、あの宇宙をみているよ'
+    cues = [dict(text=text, start=t, end=t+4, units=[
+        dict(first=0, stop=5, start=t, end=t+1.5),
+        dict(first=5, stop=7, start=t+1.5, end=t+2.),
+        dict(first=7, stop=len(text), start=t+2., end=t+4)]) for t in range(10, 80, 10)]
+    rows: list[dict[str, Any]] = [dict(text=text, spans=[]) for _ in cues]
+    rows[2]['spans'] = [dict(first=5, stop=7, text='宇宙', reading='こすもす')]
+    path, raw = tmp_path/'lyric-readings.json', tmp_path/'raw.json'
+    path.write_text(json.dumps(dict(identity=dict(source_url=URL, lines=[text]*len(cues)),
+                                    status='published', lines=rows)))
+
+    def window(t, word, probability=.97, onset=1.3, suffix='をみているよ'):
+        words = [dict(word='まだあの', start=0., end=onset),
+                 dict(word=word, start=onset, end=onset+.5, probability=probability),
+                 dict(word=suffix, start=onset+.5, end=4.)]
+        return dict(source_range=[t, t+4], recognition=dict(language='ja', segments=[dict(words=words)]))
+
+    windows = [window(10, '空'), window(20, 'ソラ'), window(30, '空'),
+               window(40, '空'), window(40, '宇宙'), window(50, '空', probability=.4),
+               window(60, '空', onset=3.), window(70, '空', suffix='へゆこう')]
+    raw.write_text(json.dumps([dict(asr_localizations=windows)]))
+    original = json.dumps(cues)
+    annotated, report = load_readings(path, cues, alignment=raw)
+
+    def ruby(row):
+        spans, _ = resolve_readings(text, row['spans'])
+        return [(text[a:b], r) for a,b,r in spans]
+
+    assert [ruby(row) for row in annotated] == [[('宇宙', r)] for r in
+        ('そら', 'そら', 'こすもす', 'うちゅう', 'うちゅう', 'うちゅう', 'うちゅう')]
+    assert report['lines'][0]['spans'][0]['recognized'] == '空'
+    assert json.dumps(cues) == original
+    assert load_readings(path, cues)[0] == rows
+    path.write_text(json.dumps(dict(identity=report['identity'], status='unavailable', lines=[])))
+    observed, report = load_readings(path, cues, alignment=raw)
+    assert report['status'] == 'local_asr' and ruby(observed[2]) == [('宇宙', 'そら')]
+    raw.write_text('invalid diagnostics')
+    assert load_readings(path, cues, alignment=raw)[0] == []
+
+
 @pytest.mark.parametrize('case', ['native', 'alias', 'wrong_work', 'wrong_title', 'live'])
 @pytest.mark.parametrize('structured', ['absent', 'linked', 'unrelated', 'malformed', 'translated'])
 def test_published_ruby_source_supplies_lyrics_without_singing_the_readings(tmp_path, monkeypatch, case, structured):
@@ -8284,7 +8326,7 @@ def test_unquoted_reading_requires_adjacent_exact_published_pair(text, expected)
         assert annotations[0]['source_text'] == text
 
 
-def test_changed_readings_or_font_invalidate_both_render_caches(tmp_path, monkeypatch):
+def test_changed_readings_recognition_or_font_invalidate_both_render_caches(tmp_path, monkeypatch):
     from karaoke import lyric_readings as readings
     from karaoke.pipeline import Pipeline
     pipeline = Pipeline(dict(url=URL), tmp_path)
@@ -8304,7 +8346,10 @@ def test_changed_readings_or_font_invalidate_both_render_caches(tmp_path, monkey
     def render(stage, command):
         assert command[command.index('--readings')+1] == path
         renders.append(path.read_text())
-        (tmp_path/'captioned-picture.mp4').write_bytes(path.read_bytes())
+        content = path.read_bytes()
+        if '--alignment' in command:
+            content += command[command.index('--alignment')+1].read_bytes()
+        (tmp_path/'captioned-picture.mp4').write_bytes(content)
         (tmp_path/'captioned-picture.render.json').write_text(json.dumps(
             {'countdown': {'events': [dict(start=-3., onset=1.)]}, 'opening_countdown': dict(start=-3., onset=1.)}))
     def publish(result, picture=None):
@@ -8327,6 +8372,12 @@ def test_changed_readings_or_font_invalidate_both_render_caches(tmp_path, monkey
     pipeline.render_video(result)
     assert result['artifacts']['mv']['render_key'] != first_key
     assert renders == ['first reading', 'corrected reading', 'corrected reading']
+    raw = tmp_path/'alignment/raw.json'
+    raw.parent.mkdir()
+    for evidence in (b'first observation', b'new observation'):
+        raw.write_bytes(evidence)
+        pipeline.render_video(result)
+        assert (tmp_path/'mv.mp4').read_bytes() == path.read_bytes()+evidence
 
 
 def test_furigana_pages_keep_full_sentence_readings_and_preview_can_shorten():

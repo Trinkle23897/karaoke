@@ -1718,22 +1718,26 @@ class Pipeline:
 
     def reading_inputs(self, result, subtitles):
         if result['language'] not in ('Japanese', 'Cantonese'):
-            return []
+            return {}
         from .lyric_readings import prepare_readings
-        return [prepare_readings([c['text'] for c in json.loads(subtitles.read_text())],
-                                 self.request['url'], self.checkpoints, result['language'])]
+        lines = [c['text'] for c in json.loads(subtitles.read_text())]
+        inputs = {'--readings': prepare_readings(lines, self.request['url'], self.checkpoints, result['language'])}
+        alignment = self.output/'alignment/raw.json'
+        if result['language'] == 'Japanese' and alignment.is_file():
+            inputs['--alignment'] = alignment
+        return inputs
 
     def render_picture(self, result):
         subtitles = self.output/result.get('artifacts', {}).get('subtitles', {}).get('path', 'cues.json')
         readings = self.reading_inputs(result, subtitles)
         picture = self.output/'captioned-picture.mp4'
-        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings],
+        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings.values()],
                 outputs=[picture, picture.with_suffix('.render.json')], config=render_config(result)) as reused:
             if not reused:
                 write_json(self.output/'song-info.json', dict(title=result['title'], artist=result['artist']))
                 self.run('render', [sys.executable, ROOT/'render_lyric_progress.py', '--video', self.video,
                     '--video-only', '--cues', subtitles, '--song-info', self.output/'song-info.json',
-                    *(['--readings', readings[0]] if readings else []),
+                    *(arg for pair in readings.items() for arg in pair),
                     '--language', {'English': 'Latin'}.get(result['language'], result['language']) or 'auto',
                     '--duration', result['duration_seconds'], '--bottom-margin', '96', '--next-line',
                     '--countdown', '--output', picture])
@@ -1746,7 +1750,7 @@ class Pipeline:
         config = render_config(result)
         result.pop('video_only', None)
         result['video_audio'] = 'silent_aac'
-        with self.checkpoints.stage('render', inputs=[self.video, paths['subtitles'], *readings],
+        with self.checkpoints.stage('render', inputs=[self.video, paths['subtitles'], *readings.values()],
                 outputs=[paths['mv'], presentation], config=config) as reused:
             if not reused:
                 self.render_uncached(result, picture)

@@ -186,6 +186,7 @@ def main():
     parser.add_argument('--video-only', action='store_true', help='Render the picture before final audio is ready')
     parser.add_argument('--cues', type=Path, required=True)
     parser.add_argument('--readings', type=Path, help='Source-bound lyric pronunciation annotations')
+    parser.add_argument('--alignment', type=Path, help='Cached recognition windows for Japanese ruby')
     parser.add_argument('--song-info', type=Path,
                         help='JSON with title, optional artist and version for opening credits')
     parser.add_argument('--start', type=float, default=0.)
@@ -206,7 +207,8 @@ def main():
     cues = json.loads(args.cues.read_text())
     if not isinstance(cues, list) or not cues:
         raise ValueError('No usable subtitle timeline')
-    annotations, reading_source = load_readings(args.readings, cues, args.language) if args.readings else ([], None)
+    annotations, reading_source = (load_readings(args.readings, cues, args.language, alignment=args.alignment)
+                                   if args.readings else ([], None))
     readings = [resolve_readings(cue['text'], annotations[i]['spans'] if i < len(annotations)
                 and annotations[i]['text'] == cue['text'] else (), args.language) for i, cue in enumerate(cues)]
     # A held tail can overlap the next entrance. Rendering advances by starts;

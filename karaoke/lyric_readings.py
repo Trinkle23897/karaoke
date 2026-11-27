@@ -299,15 +299,112 @@ def resolve_readings(text, annotations=(), language='Japanese'):
         s[0] < stop and first < s[1] for first, stop, _ in supplied))])), warnings
 
 
-def load_readings(path, cues, language='Japanese'):
+def _same_passage(start, end, observed_start, observed_end):
+    # Recognition times locate the occurrence. They never drive the sweep.
+    return abs(start-observed_start) <= .5 and abs(end-observed_end) <= .5
+
+
+def _spoken_variant(cue, words, offset):
+    """Require an intact phrase with one independently heard replacement."""
+    from subtitle_style import KANJI, japanese_readings
+    text = cue['text']
+    written, positions = text_positions(text)
+    parts = [text_positions(w['word'])[0] for w in words]
+    heard = ''.join(parts)
+    edits = SequenceMatcher(None, written, heard, autojunk=False).get_opcodes()
+    if [edit[0] for edit in edits] != ['equal', 'replace', 'equal']:
+        return None
+    _, left, right, begin, end = edits[1]
+    if left < 2 or len(written)-right < 2:
+        return None
+    # Match the whole dictionary span and whole ASR words on either side
+    # of the spelling change. A fragment of a compound has no such reading.
+    first, stop = positions[left], positions[right-1]+1
+    default = next((r for a, b, r in japanese_readings(text)[0] if (a, b) == (first, stop)), None)
+    if not default or not re.fullmatch(KANJI, text[first:stop]):
+        return None
+    owners = [i for i, part in enumerate(parts) for _ in part]
+    if owners[begin-1] == owners[begin] or owners[end-1] == owners[end]:
+        return None
+    spoken = words[owners[begin]:owners[end-1]+1]
+    if not all(.9 <= (w.get('probability') or 0) <= 1 for w in spoken):
+        return None
+    units = [u for u in cue.get('units', []) if u['first'] < stop and first < u['stop']]
+    start, finish = offset+spoken[0]['start'], offset+spoken[-1]['end']
+    if (not units or units[0]['first'] != first or units[-1]['stop'] != stop
+            or not _same_passage(units[0]['start'], units[-1]['end'], start, finish)):
+        return None
+    variant = heard[begin:end]
+    if re.fullmatch(KANJI, variant):
+        sentence = text[:first]+variant+text[stop:]
+        reading = next((r for a, b, r in japanese_readings(sentence)[0]
+                        if (a, b) == (first, first+len(variant))), None)
+    else:
+        reading = hiragana(variant)
+    if not reading or reading == default or not re.fullmatch('[ぁ-ゖー]+', reading):
+        return None
+    return dict(first=first, stop=stop, text=text[first:stop], reading=reading,
+                source='local_asr', recognized=variant, observed_range=[start, finish],
+                probability=min(w['probability'] for w in spoken))
+
+
+def _recording_readings(cues, blocks):
+    # Forced alignment repeats the supplied lyrics. Only the unprompted
+    # recognition windows can contain a different spelling of what was sung.
+    views = {}
+    for block in blocks:
+        for window in block.get('asr_localizations', []):
+            recognition = window.get('recognition') or {}
+            if recognition.get('language') not in ('ja', 'Japanese'):
+                continue
+            offset, end = window['source_range']
+            for segment in recognition.get('segments', []):
+                words = segment.get('words')
+                if (not words or not 0 <= segment.get('no_speech_prob', 0) < .6
+                        or not all(0 <= w['start'] < w['end'] <= end-offset+.001 for w in words)
+                        or any(a['end'] > b['start']+.001 for a, b in zip(words, words[1:]))):
+                    continue
+                start, finish = offset+words[0]['start'], offset+words[-1]['end']
+                matches = [i for i, cue in enumerate(cues)
+                           if _same_passage(cue['start'], cue['end'], start, finish)]
+                if len(matches) != 1:
+                    continue
+                index = matches[0]
+                span = _spoken_variant(cues[index], words, offset)
+                key = (span['first'], span['stop'], span['reading']) if span else None
+                views.setdefault(index, {})[key] = span
+    # A competing reading, including the ordinary spelling, vetoes the change.
+    return {i: next(iter(choices.values())) for i, choices in views.items()
+            if len(choices) == 1 and None not in choices}
+
+
+def load_readings(path, cues, language='Japanese', *, alignment=None):
     """Refuse stale annotations without changing any lyric or timing data."""
     try:
         packet = json.loads(path.read_text())
-        if (packet['identity'].get('language', 'Japanese') == language
-                and packet['identity']['lines'] == [cue['text'] for cue in cues] and isinstance(packet['lines'], list) and all(
-                isinstance(row, dict) and isinstance(row.get('text'), str) and isinstance(row.get('spans'), list)
-                for row in packet['lines'])):
-            return packet['lines'], packet
-        return [], dict(status='stale_lyric_body')
-    except (OSError, ValueError, KeyError, TypeError):
+        if (packet['identity'].get('language', 'Japanese') != language
+                or packet['identity']['lines'] != [cue['text'] for cue in cues] or not isinstance(packet['lines'], list)
+                or not all(isinstance(row, dict) and isinstance(row.get('text'), str) and isinstance(row.get('spans'), list)
+                           for row in packet['lines'])):
+            return [], dict(status='stale_lyric_body')
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return [], dict(status='unavailable')
+    if language == 'Japanese' and alignment is not None:
+        try:
+            raw = alignment.read_bytes()
+            variants = _recording_readings(cues, json.loads(raw))
+            rows = packet['lines'] or [dict(text=cue['text'], spans=[]) for cue in cues]
+            if variants:
+                packet['alignment_sha256'] = hashlib.sha256(raw).hexdigest()
+            for index, span in variants.items():
+                row = rows[index]
+                if row['text'] != cues[index]['text'] or any(
+                        s['first'] < span['stop'] and span['first'] < s['stop'] for s in row['spans']):
+                    continue
+                row['spans'] = sorted([*row['spans'], span], key=lambda s: s['first'])
+                packet['lines'] = rows
+                if packet.get('status') == 'unavailable':
+                    packet['status'] = 'local_asr'
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+            packet['recognition_error'] = type(error).__name__
+    return packet['lines'], packet

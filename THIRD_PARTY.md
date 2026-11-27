@@ -54,6 +54,10 @@ Ulf Hermjakob, Jonathan May, and Kevin Knight. 2018. *Out-of-the-box universal r
 
 Python 包由各 `requirements*.txt` 固定版本，Node.js、FFmpeg、LAME 和系统字体另行安装。制作容器、安装包或公开演示服务时，按实际包含的直接依赖、间接依赖和模型逐项核对许可。
 
+## 字幕字体
+
+默认字幕使用另行安装的源泉圆体 Medium（GenSenRounded 2.100）。[字体项目](https://github.com/ButTaiwan/gensen-font) · [SIL Open Font License 1.1](https://github.com/ButTaiwan/gensen-font/blob/6107da89595059ea2d9a4ff15db240b0a086a98a/SIL_Open_Font_License_1.1.txt)
+
 ## 开发检查工具
 
 Ruff 和 ty 的版本固定在 [requirements-lint.txt](requirements-lint.txt)；ESLint、`@eslint/js` 和 globals 固定在 [package.json](package.json)，间接依赖由 [package-lock.json](package-lock.json) 锁定。这些工具仅用于开发和 CI，许可证见 [Ruff](https://github.com/astral-sh/ruff/blob/main/LICENSE)、[ty](https://github.com/astral-sh/ty/blob/main/LICENSE)、[ESLint](https://github.com/eslint/eslint/blob/main/LICENSE) 和 [globals](https://github.com/sindresorhus/globals/blob/main/license)。

@@ -59,6 +59,20 @@ export KARAOKE_SEPARATOR_PYTHON="$PWD/.venv-separator/bin/python"
 
 已验证的 Linux 组合为 Ubuntu 24.04、RTX 5090、驱动 580.126.09，以及主环境和分离环境的 `torch==2.11.0` / `torchaudio==2.11.0`（CUDA 13.0 wheel）。Mac 分离环境另使用 torch 2.13.0。`benchmark_neural.py` 会检查 audio-separator 版本，并按模型配置设置类型、重叠和推理参数；权重使用下表中的配套版本。
 
+### 字幕字体
+
+在处理歌曲的电脑上安装一次源泉圆体，手机和电视直接播放带字幕的 MV。
+
+```sh
+mkdir -p karaoke/models/fonts
+font_url=https://raw.githubusercontent.com/ButTaiwan/gensen-font/6107da89595059ea2d9a4ff15db240b0a086a98a
+curl -fL "$font_url/ttc/GenSenRounded2-M.ttc" -o karaoke/models/fonts/GenSenRounded2-M.ttc
+curl -fL "$font_url/SIL_Open_Font_License_1.1.txt" -o karaoke/models/fonts/SIL_Open_Font_License_1.1.txt
+echo '907dfeb5fd0f38d89fd970c170f878d14169d66c1f30d8b08b16510c80651648  karaoke/models/fonts/GenSenRounded2-M.ttc' | shasum -a 256 -c -
+```
+
+默认按歌曲语言选字形。要换字体，用 `KARAOKE_FONT_FILE` 指定文件路径。缺字时会尝试系统字体，实际使用的字体名见渲染报告。更换字体后，新生成的 MV 会用新字形。
+
 ## 3. 对齐器源码
 
 ### 中文／日文：SOFA
@@ -129,7 +143,7 @@ export KARAOKE_DEVICE=auto
 .venv/bin/python -m karaoke.api
 ```
 
-`auto` 按 CUDA → MPS → CPU 选择设备。Linux 还需用 `KARAOKE_FONT_FILE` 指定覆盖目标语言的字体文件，例如已安装的 Noto Serif CJK 字体；遇到缺字提示时更换字体后重试。完整环境变量见 [API.md](karaoke/API.md)。
+`auto` 按 CUDA → MPS → CPU 选择设备。完整环境变量见 [API.md](karaoke/API.md)。
 
 每个数据目录运行一个 Uvicorn 服务进程。`KARAOKE_PREPARATION_CONCURRENCY=none` 允许所有已点歌曲进入阶段流水，默认值为 `1`。下载、分离、识别／对齐、音轨封装和视频编码各有共享工位。不同工位可以交叠，等待工位的任务优先处理当前待唱歌曲，再按歌单顺序处理，不中断已有步骤。任务共用缓存预算，各自保存进度、结果和错误。
 

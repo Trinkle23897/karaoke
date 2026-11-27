@@ -18,6 +18,7 @@ TOKENS = json.loads(Path(__file__).with_name('subtitle-styles.json').read_text()
 STYLES = TOKENS['styles']
 DEFAULT_STYLE = TOKENS['default_style']
 KANJI = r'[\u3400-\u9fff\uf900-\ufaff\U00020000-\U0002ffff々〆]+'
+WRAP_TOKEN = re.compile(r"[A-Za-z0-9’'\-]+|[^\S\n]+|.", re.DOTALL)
 
 
 class CaptionOverflow(ValueError):
@@ -197,8 +198,9 @@ def cantonese_readings(text):
     return tuple(spans), tuple(warnings)
 
 
-def caption_height(language):
-    return TOKENS['strip_height']+(TOKENS['furigana']['extra_height'] if language in ('Japanese', 'Cantonese') else 0)
+def caption_height(language, style=DEFAULT_STYLE):
+    height = STYLES[style].get('strip_height', TOKENS['strip_height'])
+    return height+(TOKENS['furigana']['extra_height'] if language in ('Japanese', 'Cantonese') else 0)
 
 
 def annotated_lines(text, readings, font, ruby_font, tracking, maximum, balanced):
@@ -208,10 +210,9 @@ def annotated_lines(text, readings, font, ruby_font, tracking, maximum, balanced
     while cursor < len(text):
         stop, reading = spans.get(cursor, (None, None))
         if stop is None:
-            match = re.match(r"[A-Za-z0-9’'\-]+|[^\S\n]+|[^\n]|\n", text[cursor:])
+            match = WRAP_TOKEN.match(text, cursor)
             assert match is not None  # The alternatives cover every character.
-            token = match[0]
-            stop = cursor+len(token)
+            stop = match.end()
         token = text[cursor:stop]
         width = max(line_width(token, font, tracking),
                     ruby_font.getlength(reading)+2*ruby_font.size*TOKENS['furigana']['side_padding_em'] if reading else 0)
@@ -291,26 +292,41 @@ def coverage(path, index):
         return set()
 
 
+def font_inputs(style=DEFAULT_STYLE, font_file=None):
+    """Files shared by font selection and render checkpoints, in priority order."""
+    override = font_file or os.getenv('KARAOKE_FONT_FILE')
+    paths = [Path(override).resolve()] if override else []
+    asset = STYLES[style].get('font_asset')
+    if asset:
+        path = (Path(__file__).parent/'models'/'fonts'/asset).resolve()
+        if path.is_file() and path not in paths:
+            paths.append(path)
+    return paths
+
+
 def resolve_font(text, style=DEFAULT_STYLE, language='auto', font_file=None):
-    font_file = font_file or os.getenv('KARAOKE_FONT_FILE')
+    spec = STYLES[style]
     script = script_for(text, language)
-    name, index = STYLES[style]['fonts'][script]
     # Formatting controls (e.g. BOM / zero-width joiner) have no visible glyph.
     # Keep the source string and its timing indices intact.
     required = {ord(c) for c in text if not c.isspace() and unicodedata.category(c) != 'Cf'}
-    candidates = [(Path(font_file), 0)] if font_file else []
-    if not font_file:
-        try:
-            candidates.append((system_font(name), index))
-        except FileNotFoundError:
-            pass
-    for path, index in candidates:
+    for path in font_inputs(style, font_file):
+        index = spec['asset_faces'].get(script, 0) if path.name == spec.get('font_asset') else 0
         if required <= coverage(path, index):
             return path, index, script
-    # Select by actual glyph coverage, independently of the song's language.
+    name, index = spec['fonts'][script]
     try:
+        path = system_font(name)
+        if required <= coverage(path, index):
+            return path, index, script
+    except FileNotFoundError:
+        pass
+    # Select by actual glyph coverage, independently of the song's language.
+    candidates = []
+    try:
+        family = spec.get('fallback_family', '')
         fonts = subprocess.check_output(['fc-match', '-s', '--format', '%{file}\t%{index}\n',
-            ':charset='+' '.join(f'{c:x}' for c in sorted(required))], text=True, timeout=5)
+            family+':charset='+' '.join(f'{c:x}' for c in sorted(required))], text=True, timeout=5)
         candidates.extend((Path(path), int(index)) for path, index in
                           (line.rsplit('\t', 1) for line in fonts.splitlines()))
     except (FileNotFoundError, subprocess.SubprocessError):
@@ -331,7 +347,7 @@ def wrap_lines(text, font, tracking, maximum):
     for paragraph in text.split('\n'):
         line = ''
         # Keep Latin words intact; CJK can wrap between characters.
-        for token in re.findall(r"[A-Za-z0-9’'\-]+|[^\S\n]+|[^\n]", paragraph):
+        for token in WRAP_TOKEN.findall(paragraph):
             if line and line_width(line+token, font, tracking) > maximum:
                 lines.append(line.rstrip())
                 line = token.lstrip()
@@ -376,7 +392,7 @@ def caption_image(text, width=1280, height=None, font_file=None,
                   style_overrides=None, readings=()):
     """Return a transparent strip. No box, gradient, or background repainting."""
     scale = width/TOKENS['reference_width']
-    height = height or round(TOKENS['strip_height']*scale)
+    height = height or round(caption_height(language, style)*scale)
     supersample = 2
     image = Image.new('RGBA', (width*supersample, height*supersample))
     if not text.strip():
@@ -385,23 +401,29 @@ def caption_image(text, width=1280, height=None, font_file=None,
     path, index, script = resolve_font(text, style, language, font_file)
     font_scale = scale*supersample
     tracking_em = spec['latin_tracking_em'] if script == 'Latin' else spec['tracking_em']
-    maximum = width*(1-2*TOKENS['safe_x'])*supersample
-    one_line = [(size, True) for size in range(spec['size'], spec.get('single_line_floor', spec['size']+1)-1, -2)]
-    sizes = one_line+[(size, False) for size in range(spec['size'], spec.get('minimum_size', TOKENS['minimum_font_size'])-1, -2)]
+    margin = image.width*spec.get('safe_x', TOKENS['safe_x'])
+    maximum = image.width-2*margin
+    maximum_lines = spec.get('maximum_lines', 2)
+    sizes = [(size, maximum_lines == 1)
+             for size in range(spec['size'], spec.get('minimum_size', TOKENS['minimum_font_size'])-1, -2)]
+    if maximum_lines > 1 and 'single_line_floor' in spec:
+        sizes = [(size, True) for size in range(spec['size'], spec['single_line_floor']-1, -2)]+sizes
     for size, require_single in sizes:
         font = ImageFont.truetype(str(path), round(size*font_scale), index=index)
         tracking = size*font_scale*tracking_em
+        balanced = spec.get('balanced_wrap') and not require_single
         if readings:
-            ruby_font = ImageFont.truetype(str(path), max(1, round(size*font_scale*TOKENS['furigana']['size_em'])), index=index)
-            rows = annotated_lines(text, readings, font, ruby_font, tracking, maximum, spec.get('balanced_wrap'))
+            ruby_size = spec.get('reading_size_em', TOKENS['furigana']['size_em'])
+            ruby_font = font.font_variant(size=max(1, round(size*font_scale*ruby_size)))
+            rows = annotated_lines(text, readings, font, ruby_font, tracking, maximum, balanced)
             lines = [''.join(item['text'] for item in row) for row in rows]
             widths = [sum(item['width'] for item in row)+max(0, len(row)-1)*tracking for row in rows]
         else:
-            lines = (balanced_lines if spec.get('balanced_wrap') else wrap_lines)(text, font, tracking, maximum)
+            lines = (balanced_lines if balanced else wrap_lines)(text, font, tracking, maximum)
             widths = [line_width(line, font, tracking) for line in lines]
         if require_single and len(lines) > 1:
             continue
-        if len(lines) <= spec.get('maximum_lines', 2) and all(length <= maximum for length in widths):
+        if len(lines) <= maximum_lines and all(length <= maximum for length in widths):
             break
     else:
         raise CaptionOverflow('Caption exceeds the readable line limit; split the lyric cue')
@@ -409,21 +431,44 @@ def caption_image(text, width=1280, height=None, font_file=None,
     draw = ImageDraw.Draw(mask)
     ruby_mask = Image.new('L', image.size)
     ruby_draw = ImageDraw.Draw(ruby_mask)
+    if spec.get('rim_width'):
+        edge = Image.new('L', image.size)
+        rim = Image.new('L', image.size)
+        edge_draw, rim_draw = ImageDraw.Draw(edge), ImageDraw.Draw(rim)
+
+    def draw_ink(pen, position, value, face):
+        weight = 0
+        if spec.get('rim_width'):
+            # A single dark contour keeps small reading marks legible when scaled down.
+            weight = max(1, round(face.size*spec['weight_em']))
+            factor = face.size/STYLES[style]['size']
+            inner = weight+max(1, round(factor*spec['outline_width']))
+            outer = inner+max(1, round(factor*spec['rim_width']))
+            edge_draw.text(position, value, font=face, fill=255, anchor='ls',
+                           stroke_width=outer if pen is ruby_draw else inner)
+            rim_draw.text(position, value, font=face, fill=255, anchor='ls', stroke_width=outer)
+        pen.text(position, value, font=face, fill=255, anchor='ls', stroke_width=weight)
+        return pen.textbbox(position, value, font=face, anchor='ls', stroke_width=weight)
+
     baseline = (height-spec.get('baseline_inset', 36)*scale)*supersample
     characters, ruby_boxes = [], []
     cursor = 0
     line_height = size*font_scale*spec['line_height']
     if readings:
-        ruby_offset = size*font_scale+TOKENS['furigana']['gap']*font_scale+ruby_font.getmetrics()[1]
-        body_bottom = max(font.getbbox(line, anchor='ls')[3] for line in lines)
-        ruby_top = min(ruby_font.getbbox(item['reading'], anchor='ls')[1]
-                       for row in rows for item in row if item['reading'])
+        body = [font.getbbox(line, anchor='ls') for line in lines]
+        ruby = [ruby_font.getbbox(item['reading'], anchor='ls') for row in rows for item in row if item['reading']]
+        if 'reading_gap' in spec:
+            ruby_offset = max(r[3] for r in ruby)-min(b[1] for b in body)+spec['reading_gap']*font_scale
+        else:
+            ruby_offset = size*font_scale+TOKENS['furigana']['gap']*font_scale+ruby_font.getmetrics()[1]
+        body_bottom = max(b[3] for b in body)
+        ruby_top = min(r[1] for r in ruby)
         line_height = max(line_height+ruby_font.size, body_bottom+ruby_offset-ruby_top)
         line_height += TOKENS['furigana']['line_gap']*font_scale
     for i, line in enumerate(lines):
         length = widths[i]
-        x = ((width*supersample-length)/2 if spec['alignment'] == 'center'
-             else width*TOKENS['safe_x']*supersample)
+        x = {'left': margin, 'center': (image.width-length)/2,
+             'right': image.width-margin-length}[spec['alignment']]
         y = baseline-(len(lines)-i-1)*line_height
         offset = text.find(line, cursor)
         if offset < 0:
@@ -433,8 +478,7 @@ def caption_image(text, width=1280, height=None, font_file=None,
             glyph_x = x+(item['width']-line_width(item['text'], font, tracking))/2
             for j, character in enumerate(item['text']):
                 position = (round(glyph_x), round(y))
-                draw.text(position, character, font=font, fill=255, anchor='ls')
-                bounds = draw.textbbox(position, character, font=font, anchor='ls')
+                bounds = draw_ink(draw, position, character, font)
                 characters.append({'index': item['first']+j, 'line': i, 'character': character,
                     'left': min(glyph_x, bounds[0])/supersample,
                     'right': max(glyph_x+font.getlength(character), bounds[2])/supersample,
@@ -445,8 +489,7 @@ def caption_image(text, width=1280, height=None, font_file=None,
                 bounds = ruby_font.getbbox(item['reading'], anchor='ls')
                 position = (round(x+item['width']/2-(bounds[0]+bounds[2])/2),
                             round(y-ruby_offset))
-                ruby_draw.text(position, item['reading'], font=ruby_font, fill=255, anchor='ls')
-                box = ruby_draw.textbbox(position, item['reading'], font=ruby_font, anchor='ls')
+                box = draw_ink(ruby_draw, position, item['reading'], ruby_font)
                 ruby_boxes.append(dict(first=item['first'], stop=item['stop'], reading=item['reading'], line=i,
                                        bounds=tuple(value/supersample for value in box),
                                        baseline=position[1]/supersample))
@@ -456,22 +499,25 @@ def caption_image(text, width=1280, height=None, font_file=None,
     if tone not in ('light', 'dark'):
         raise ValueError('tone must be light or dark')
     color = spec['color'] if tone == 'light' else '#172028'
-    shadow_rgb = (0, 0, 0) if tone == 'light' else (255, 255, 255)
-    # A fine local edge and soft shadow protect glyphs without a heavy outline.
-    edge_radius = max(1, round(spec.get('outline_width', .5)*font_scale))
-    for alpha in [visible_mask.filter(ImageFilter.GaussianBlur(spec.get('shadow_blur', 2.4)*font_scale))
-                       .point(lambda a: round(a*spec.get('shadow_alpha', .6))),
-                  outline_mask(visible_mask, edge_radius)
-                       .point(lambda a: round(a*spec.get('outline_alpha', .34)))]:
-        shadow = Image.new('RGBA', image.size, shadow_rgb+(0,))
-        shadow.putalpha(alpha)
-        image.alpha_composite(shadow)
-    foreground = Image.new('RGBA', image.size, ImageColor.getrgb(color)+(0,))
-    foreground.putalpha(visible_mask)
-    image.alpha_composite(foreground)
+    blur = ImageFilter.GaussianBlur(spec.get('shadow_blur', 2.4)*font_scale)
+    if spec.get('rim_width'):
+        glow = rim.filter(blur).point(lambda a: min(255, round(a*1.8)))
+        layers = [(spec['progress_color'], glow), (color, rim),
+                  ('#22202a' if tone == 'light' else '#ffffff', edge)]
+    else:
+        contrast = '#000000' if tone == 'light' else '#ffffff'
+        edge_radius = max(1, round(spec.get('outline_width', .5)*font_scale))
+        layers = [(contrast, visible_mask.filter(blur).point(lambda a: round(a*spec.get('shadow_alpha', .6)))),
+                  (contrast, outline_mask(visible_mask, edge_radius).point(lambda a: round(a*spec.get('outline_alpha', .34))))]
+    for paint, alpha in [*layers, (color, visible_mask)]:
+        layer = Image.new('RGBA', image.size, paint)
+        layer.putalpha(alpha)
+        image.alpha_composite(layer)
     if layout_out is not None:
         layout_out.update(mask=mask.resize((width, height), Image.Resampling.LANCZOS),
                           characters=characters, font_size=size, lines=lines, ruby=ruby_boxes,
+                          font=' '.join(part for part in font.getname() if part),
+                          wrap_height=round((len(lines)-1)*line_height/supersample),
                           content_top=min([c['top'] for c in characters]+[r['bounds'][1] for r in ruby_boxes]))
     return image.resize((width, height), Image.Resampling.LANCZOS)
 
@@ -487,11 +533,14 @@ def compact_caption_image(text, **options):
     try:
         return caption_image(text, **options)
     except CaptionOverflow:
-        low, high = 0, len(text)-1
+        # Prefer a whole last word. Even a single oversized title can be abbreviated.
+        stops = [m.end() for m in WRAP_TOKEN.finditer(text)]
+        stops = list(range(1, stops[0])) + stops[:-1]
+        low, high = 0, len(stops)-1
         row = caption_image('…', **dict(options, readings=()))
         while low <= high:
             middle = (low+high)//2
-            candidate_text = text[:middle].rstrip()+'…'
+            candidate_text = text[:stops[middle]].rstrip()+'…'
             candidate_options = dict(options)
             if options.get('readings'):
                 candidate_options['readings'] = tuple(

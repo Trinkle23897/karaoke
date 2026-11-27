@@ -1,6 +1,6 @@
 {
-  "version": 10,
-  "default_style": "cinema_focus",
+  "version": 11,
+  "default_style": "karaoke",
   "reference_width": 1280,
   "strip_height": 200,
   "bottom_margin": 40,
@@ -34,6 +34,41 @@
     "above_text": 20
   },
   "styles": {
+    "karaoke": {
+      "label": "双行跟唱",
+      "description": "圆角粗体 · 上行靠左、下行靠右 · 原位轮流扫亮",
+      "size": 62,
+      "minimum_size": 48,
+      "single_line_floor": 48,
+      "balanced_wrap": true,
+      "tracking_em": 0.025,
+      "latin_tracking_em": 0.025,
+      "line_height": 1.27,
+      "reading_size_em": 0.44,
+      "reading_gap": 8,
+      "safe_x": 0.055,
+      "strip_height": 232,
+      "baseline_inset": 54,
+      "alignment": "left",
+      "row_step": 114,
+      "color": "#f6f4ec",
+      "progress_color": "#e59a24",
+      "weight_em": 0.008,
+      "outline_width": 1.9,
+      "rim_width": 3,
+      "shadow_blur": 6,
+      "fade_in_ms": 0,
+      "fade_out_ms": 0,
+      "font_asset": "GenSenRounded2-M.ttc",
+      "asset_faces": {"Japanese": 2},
+      "fallback_family": "sans-serif",
+      "fonts": {
+        "Japanese": ["ヒラギノ丸ゴ ProN W4.ttc", 1],
+        "Chinese": ["Hiragino Sans GB.ttc", 0],
+        "Korean": ["AppleSDGothicNeo.ttc", 2],
+        "Latin": ["Supplemental/Arial Rounded Bold.ttf", 0]
+      }
+    },
     "cinema_focus": {
       "label": "余韵 · 跟唱",
       "description": "较厚宋体 · 暖白 · 清楚而安静的跟唱提示",

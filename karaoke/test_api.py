@@ -7619,6 +7619,32 @@ def test_auxiliary_intro_and_long_preview_cannot_abort_valid_lyric_video(tmp_pat
     assert json.loads((tmp_path/'cues.json').read_text()) == cues
 
 
+def test_karaoke_preview_sings_in_place_on_alternating_rows(tmp_path, monkeypatch):
+    import karaoke.render_lyric_progress as renderer
+    source, output = tmp_path/'source.mp4', tmp_path/'song.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=black:s=320x180:r=8:d=1.5',
+                    '-c:v', 'libx264', str(source)], check=True)
+    cues = [dict(text=text, start=max(0, start-.2), end=start+.3,
+                 units=[dict(first=0, stop=len(text), start=start, end=start+.25)])
+            for text, start in [('海風', 0.), ('晚霞', .5), ('月光', 1.)]]
+    path = tmp_path/'cues.json'
+    path.write_text(json.dumps(cues))
+    monkeypatch.setattr(sys, 'argv', [renderer.__file__, '--video', str(source), '--video-only',
+        '--cues', str(path), '--language', 'Chinese', '--duration', '1.5', '--output', str(output)])
+    renderer.main()
+    raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output),
+        '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'])
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 720, 1280, 3)
+    for onset, row in [(4, frames[:, 580:, 640:]), (8, frames[:, 430:580, :640])]:
+        # The upcoming line stays white through its own onset, even though the
+        # display interval starts earlier. Its amber fill uses those same pixels.
+        white = row[onset-1].min(axis=-1) > 210
+        assert white.any()
+        assert (row[onset][white].min(axis=-1) > 180).mean() > .9
+        red, green, blue = row[onset+2][white].T
+        assert ((red > 180) & (green > 100) & (blue < 110)).mean() > .2
+
+
 def test_lyric_renderer_rejects_missing_text(tmp_path, monkeypatch):
     import karaoke.render_lyric_progress as renderer
     cues, output = tmp_path/'cues.json', tmp_path/'output.mp4'
@@ -7848,7 +7874,7 @@ def test_linear_playback_sweeps_locally_and_preserves_measured_onsets(monkeypatc
     ('Japanese', '静かな夜に\n僕は歌う'),
     ('Korean', '우리 함께\n노래해'),
 ])
-@pytest.mark.parametrize('style', ['cinema_focus', 'cinema', 'clear', 'stage'])
+@pytest.mark.parametrize('style', ['karaoke', 'cinema_focus', 'cinema', 'clear', 'stage'])
 def test_completed_sweep_colors_entire_real_glyph_without_touching_next_line(language, text, style):
     from karaoke.render_lyric_progress import Caption
     split = text.index('\n')
@@ -7948,7 +7974,8 @@ def test_cantonese_dictionary_failure_keeps_timed_subtitles(monkeypatch):
 @pytest.mark.parametrize('language,text', [
     ('Japanese', '貴方から承った物語を今日も思い出す\n明日は君と同じ空を見上げたい'),
     ('Cantonese', '晚風輕輕吹過窗邊\n我哋一齊望住星空唱歌')])
-def test_furigana_layout_preserves_timing_and_keeps_readings_out_of_sweep(language, text):
+@pytest.mark.parametrize('style', ['karaoke', 'cinema_focus'])
+def test_furigana_layout_preserves_timing_and_keeps_readings_out_of_sweep(language, text, style):
     import copy
 
     from PIL import ImageChops
@@ -7957,12 +7984,12 @@ def test_furigana_layout_preserves_timing_and_keeps_readings_out_of_sweep(langua
     cue = dict(text=text, units=[dict(first=i, stop=i+1, start=i+1., end=i+1.8)
                                 for i,c in enumerate(text) if not c.isspace()])
     before = copy.deepcopy(cue)
-    caption = Caption(cue, 'cinema_focus', language)
+    caption = Caption(cue, style, language)
     assert cue == before and not caption.pages
     assert len(caption.layout['lines']) == 2
     assert caption.frame(.5, 'word').tobytes() == caption.base.tobytes()
     swept = caption.frame(len(text)+1, 'word')
-    assert ImageChops.difference(swept, caption.base).getbbox() is not None
+    assert ImageChops.difference(swept.convert('RGB'), caption.base.convert('RGB')).getbbox() is not None
     boxes = caption.layout['ruby']
     assert len(boxes) == len(caption.readings) > 6
     for ruby in boxes:
@@ -8261,7 +8288,7 @@ def test_unquoted_reading_requires_adjacent_exact_published_pair(text, expected)
         assert annotations[0]['source_text'] == text
 
 
-def test_changed_published_readings_invalidate_both_render_caches(tmp_path, monkeypatch):
+def test_changed_readings_or_font_invalidate_both_render_caches(tmp_path, monkeypatch):
     from karaoke import lyric_readings as readings
     from karaoke.pipeline import Pipeline
     pipeline = Pipeline(dict(url=URL), tmp_path)
@@ -8271,6 +8298,9 @@ def test_changed_published_readings_invalidate_both_render_caches(tmp_path, monk
     (tmp_path/'cues.json').write_text(json.dumps([dict(text=text, units=[])]))
     path = tmp_path/'lyric-readings.json'
     path.write_text('first reading')
+    font = tmp_path/'lyric-font.ttc'
+    font.write_bytes(b'first face')
+    monkeypatch.setenv('KARAOKE_FONT_FILE', str(font))
     monkeypatch.setattr(readings, 'prepare_readings', lambda *a: path)
     result: dict[str, Any] = dict(title='Example', artist='Artist', language='Japanese', duration_seconds=3.,
                   artifacts={'subtitles': {'path': 'cues.json'}, 'mv': {'path': 'mv.mp4'}})
@@ -8295,6 +8325,9 @@ def test_changed_published_readings_invalidate_both_render_caches(tmp_path, monk
     pipeline.render_video(result)
     assert renders == ['first reading', 'corrected reading']
     assert (tmp_path/'mv.mp4').read_text() == 'corrected reading'
+    font.write_bytes(b'new face')
+    pipeline.render_video(result)
+    assert renders == ['first reading', 'corrected reading', 'corrected reading']
 
 
 def test_furigana_pages_keep_full_sentence_readings_and_preview_can_shorten():

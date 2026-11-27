@@ -4,6 +4,7 @@ import json
 import subprocess
 import time
 from bisect import bisect_right
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageColor, ImageDraw
@@ -12,6 +13,7 @@ from lyric_readings import load_readings, resolve_readings
 from render_subtitles import video_frame_rate
 from stage_progress import progress_items, report_progress
 from subtitle_style import (
+    DEFAULT_STYLE,
     STYLES,
     TOKENS,
     CaptionOverflow,
@@ -27,8 +29,9 @@ from subtitles import countdown_events, countdown_state, normalized, read_ahead_
 class Caption:
     readings: tuple[tuple[int, int, str], ...]
 
-    def __init__(self, cue, style, language, readings=None):
+    def __init__(self, cue, style, language, readings=None, *, lower=False):
         self.cue = cue
+        self.lower = lower
         self.readings, self.reading_warnings = (readings if readings is not None else
             resolve_readings(cue['text'], language=language))
         self.layout = {}
@@ -37,7 +40,7 @@ class Caption:
         while True:
             try:
                 self.base = caption_image(cue['text'], style=style, language=language, layout_out=self.layout,
-                                          height=caption_height(language), readings=self.readings)
+                    readings=self.readings, style_overrides={'alignment': 'right'} if lower else None)
             except CaptionOverflow:
                 try:
                     self.pages = self.paginate(style, language)
@@ -56,10 +59,18 @@ class Caption:
         self.starts = [u['start'] for u in cue.get('units', [])]
         self.cache = {}
         spec = TOKENS['countdown']
+        chars = self.layout['characters']
+        x = self.base.width/2
+        y = self.layout.get('content_top', min(c['top'] for c in chars))-spec['above_text']
+        if STYLES[style].get('row_step'):
+            # Put the dots at the start of the active row, outside the pair.
+            x = chars[0]['left']+spec['radius']+(spec['dots']-1)*spec['spacing']/2
+            if lower:
+                y = max(c['bottom'] for c in chars)+spec['above_text']
+        inset = spec['radius']+3
         self.countdown_geometry = dict(radius=spec['radius'], spacing=spec['spacing'],
             color=STYLES[style].get('progress_color', '#efd29a'),
-            y=max(spec['radius']+3, self.layout.get('content_top', min(
-                c['top'] for c in self.layout['characters']))-spec['above_text']))
+            x=round(x), y=max(inset, min(self.base.height-inset, y)))
 
     def paginate(self, style, language):
         """Change only the display pages, at existing measured unit boundaries."""
@@ -80,8 +91,7 @@ class Caption:
                 end = units[stop]['first'] if stop < len(units) else len(text)
                 readings = tuple((a-begin,b-begin,kana) for a,b,kana in self.readings if begin <= a and b <= end)
                 try:
-                    caption_image(text[begin:end], style=style, language=language,
-                                  height=caption_height(language), readings=readings)
+                    caption_image(text[begin:end], style=style, language=language, readings=readings)
                 except CaptionOverflow:
                     high = middle-1
                 else:
@@ -92,18 +102,18 @@ class Caption:
             page = dict(self.cue, text=text[begin:end], units=[
                 dict(unit, first=unit['first']-begin, stop=unit['stop']-begin) for unit in units[first:fit]])
             readings = tuple((a-begin,b-begin,kana) for a,b,kana in self.readings if begin <= a and b <= end)
-            pages.append(Caption(page, style, language, (readings, self.reading_warnings)))
+            pages.append(Caption(page, style, language, (readings, self.reading_warnings), lower=self.lower))
             first = fit
         return pages
 
     def countdown(self, remaining, total):
-        """Fixed dot positions above the lyric; exhausted dots become faint rings."""
+        """Keep dot positions fixed as exhausted dots become faint rings."""
         spec = self.countdown_geometry
         image = Image.new('RGBA', self.base.size)
         draw = ImageDraw.Draw(image)
         y = spec['y']
         for index in range(total):
-            x = image.width/2+(index-(total-1)/2)*spec['spacing']
+            x = spec['x']+(index-(total-1)/2)*spec['spacing']
             radius = spec['radius']
             bounds = (x-radius, y-radius, x+radius, y+radius)
             active = index >= total-remaining
@@ -112,10 +122,12 @@ class Caption:
                          outline=self.color+(255,) if active else (246, 244, 236, 160), width=2)
         return image
 
+    def page(self, instant):
+        return self.pages[max(0, bisect_right(self.starts, instant)-1)] if self.pages else self
+
     def frame(self, instant, mode, *, page_at=None):
         if self.pages:
-            page = max(0, bisect_right(self.starts, instant if page_at is None else page_at)-1)
-            return self.pages[page].frame(instant, mode)
+            return self.page(instant if page_at is None else page_at).frame(instant, mode)
         index = bisect_right(self.starts, instant)-1
         if mode == 'static' or index < 0:
             return self.base
@@ -179,7 +191,7 @@ def main():
     parser.add_argument('--start', type=float, default=0.)
     parser.add_argument('--duration', type=float, required=True)
     parser.add_argument('--mode', choices=['word', 'underline', 'static'], default='word')
-    parser.add_argument('--style', choices=STYLES, default='cinema_focus')
+    parser.add_argument('--style', choices=STYLES, default=DEFAULT_STYLE)
     parser.add_argument('--language', required=True)
     parser.add_argument('--bottom-margin', type=int, default=64)
     parser.add_argument('--next-line', action=argparse.BooleanOptionalAction, default=True,
@@ -202,9 +214,11 @@ def main():
     if any(c['end'] <= c['start'] for c in cues) or any(a['start'] >= b['start'] for a, b in zip(cues, cues[1:])):
         raise ValueError('Invalid display intervals')
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    main_height = caption_height(args.language)
-    preview_height = (64+(TOKENS['furigana']['preview_extra_height'] if args.language in ('Japanese', 'Cantonese') else 0)
-                      if args.next_line else 0)
+    main_height = caption_height(args.language, args.style)
+    row_step = STYLES[args.style].get('row_step', 0) if args.next_line else 0
+    preview_height = row_step
+    if args.next_line and not row_step:
+        preview_height = 64+(TOKENS['furigana']['preview_extra_height'] if args.language in ('Japanese', 'Cantonese') else 0)
     args.bottom_margin = max(args.bottom_margin, preview_height)
     width, height = 1280, main_height+preview_height
     fps = video_frame_rate(args.video)
@@ -269,9 +283,34 @@ def main():
     countdown = countdown_events(cues, minimum_silence=TOKENS['countdown']['minimum_silence_seconds'],
         dots=TOKENS['countdown']['dots'], step_seconds=TOKENS['countdown']['step_seconds'],
         settle_seconds=TOKENS['countdown']['settle_seconds']) if args.countdown else []
-    previous, caption = None, None
-    preview_previous, preview_image = None, None
-    shown, pagination, readings_report = set(), {}, {}
+    @lru_cache(maxsize=2)
+    def caption_at(index):
+        return Caption(cues[index], args.style, args.language, readings[index], lower=bool(row_step and index % 2))
+
+    @lru_cache(maxsize=1)
+    def backdrop(preview, lift):
+        if preview is None:
+            return blank
+        if row_step:
+            # Use the very same lettering before and after the next onset.
+            following = caption_at(preview).page(0)
+            image = following.base
+            if len(following.layout['lines']) > 1:
+                image = compact_caption_image(following.cue['text'], style=args.style, language=args.language,
+                    readings=following.readings, style_overrides={'maximum_lines': 1,
+                        'alignment': 'right' if following.lower else 'left'})
+            y = row_step if following.lower else -lift
+        else:
+            image = compact_caption_image(cues[preview]['text'], height=preview_height,
+                style=args.style, language=args.language, readings=readings[preview][0],
+                style_overrides={'size': 34, 'minimum_size': 26, 'single_line_floor': 34,
+                                 'maximum_lines': 1, 'balanced_wrap': False, 'baseline_inset': 22})
+            y = main_height
+        picture = blank.copy()
+        picture.paste(image, (0, y))
+        return picture
+
+    shown, fonts, pagination, readings_report = set(), set(), {}, {}
     log = args.output.with_suffix('.ffmpeg.log')
     with log.open('w') as errors:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors)
@@ -291,37 +330,28 @@ def main():
                     # The previous singing has ended; prepare the next lyric without highlighting it early.
                     index = entry['line']
                     preview = index+1 if args.next_line and index+1 < len(cues) else None
-                picture = blank.copy() if preview_height else blank
+                picture = blank
                 if index is not None:
-                    if previous != index:
-                        caption = Caption(cues[index], args.style, args.language, readings[index])
+                    caption = caption_at(index)
+                    if index not in shown:
                         if caption.pages:
                             pagination[index+1] = [dict(text=p.cue['text'], start=p.starts[0]) for p in caption.pages]
                         if args.language in ('Japanese', 'Cantonese'):
                             readings_report[index+1] = dict(spans=caption.readings, warnings=caption.reading_warnings)
-                        previous = index
-                    assert caption is not None
-                    current = caption.frame(instant, args.mode, page_at=entry['onset'] if entry is not None else None)
+                        shown.add(index)
+                    page = caption.page(entry['onset'] if entry is not None else instant)
+                    fonts.add(page.layout['font'])
+                    current = page.frame(instant, args.mode)
+                    if entry is not None:
+                        current = Image.alpha_composite(current, page.countdown(remaining, entry['dots']))
                     if preview_height:
-                        picture.alpha_composite(current)
+                        # A wrapped lower lyric grows upward. Lift the preview by
+                        # that same amount to keep both the text and ruby clear.
+                        lift = page.layout['wrap_height'] if page.lower else 0
+                        picture = backdrop(preview, lift).copy()
+                        picture.alpha_composite(current, (0, row_step if page.lower else 0))
                     else:
                         picture = current
-                    if entry is not None:
-                        # Copy also in single-line mode so the cached caption remains unchanged.
-                        picture = picture.copy()
-                        picture.alpha_composite(caption.countdown(remaining, entry['dots']))
-                    shown.add(index)
-                if preview is not None:
-                    if preview_previous != preview:
-                        preview_image = compact_caption_image(cues[preview]['text'], height=preview_height,
-                            style=args.style, language=args.language,
-                            readings=readings[preview][0],
-                            style_overrides={
-                                'size': 34, 'minimum_size': 26, 'single_line_floor': 34,
-                                'maximum_lines': 1, 'balanced_wrap': False, 'baseline_inset': 22})
-                        preview_previous = preview
-                    assert preview_image is not None
-                    picture.alpha_composite(preview_image, (0, main_height))
                 process.stdin.write(picture.tobytes())
             process.stdin.close()
             report_progress(detail='封装视频')
@@ -340,14 +370,14 @@ def main():
         raise ValueError('Incorrect rendered duration')
     opening = None
     if countdown and countdown[0]['start'] < 0:
-        geometry = Caption(cues[0], args.style, args.language, readings[0]).countdown_geometry
+        geometry = caption_at(0).countdown_geometry
         opening = dict(countdown[0], **geometry, width=width, height=720)
         opening['y'] += 720-main_height-args.bottom_margin
     report = {'command': command, 'seconds': time.perf_counter()-started, 'start': args.start,
         'frame_rate': str(fps),
         'duration': args.duration, 'mode': args.mode, 'style': args.style, 'style_version': TOKENS['version'],
         'style_parameters': STYLES[args.style],
-        'font': 'Bold Songti / Hiragino Mincho W6; source glyphs verified',
+        'font': ' / '.join(sorted(fonts)),
         'shown_lines': sorted(i+1 for i in shown),
         'display_pages': pagination,
         'furigana': readings_report,

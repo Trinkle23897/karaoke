@@ -69,7 +69,7 @@ def pipeline_fingerprint():
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     # Model/config changes invalidate the cache without hashing GBs on each submission.
-    for path in sorted((ROOT/'models/pretrained').glob('*roformer*')):
+    for path in sorted([*(ROOT/'models/pretrained').glob('*roformer*'), *(ROOT/'models/fonts').glob('*.ttc')]):
         stat = path.stat()
         digest.update(f'{path.name}:{stat.st_size}:{stat.st_mtime_ns}'.encode())
     for path in sorted(p for directory in ('whisper', 'sofa', 'mms', 'qwen3-forced-aligner-0.6b')
@@ -1692,10 +1692,11 @@ class Pipeline:
                                  self.request['url'], self.checkpoints, result['language'])]
 
     def render_picture(self, result):
+        from .subtitle_style import font_inputs
         subtitles = self.output/result.get('artifacts', {}).get('subtitles', {}).get('path', 'cues.json')
         readings = self.reading_inputs(result, subtitles)
         picture = self.output/'captioned-picture.mp4'
-        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings],
+        with self.checkpoints.stage('render_picture', inputs=[self.video, subtitles, *readings, *font_inputs()],
                 outputs=[picture, picture.with_suffix('.render.json')],
                 config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
                         'implementation': inspect.getsource(type(self).render_picture)},
@@ -1712,13 +1713,14 @@ class Pipeline:
         return picture
 
     def render_video(self, result, picture=None):
+        from .subtitle_style import font_inputs
         paths = {name: self.output/a['path'] for name, a in result['artifacts'].items()}
         readings = self.reading_inputs(result, paths['subtitles'])
         presentation = paths['mv'].with_suffix('.presentation.json')
         result.pop('video_only', None)
         result['video_audio'] = 'silent_aac'
         with self.checkpoints.stage('render',
-                inputs=[self.video, paths['subtitles'], *readings],
+                inputs=[self.video, paths['subtitles'], *readings, *font_inputs()],
                 outputs=[paths['mv'], presentation],
                 config={**{key: result[key] for key in ('title', 'artist', 'language', 'duration_seconds')},
                     'implementation': [inspect.getsource(type(self).render_video),

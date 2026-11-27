@@ -64,7 +64,8 @@ def main():
     folder = args.output.parent/(args.output.stem+'-caption-images')
     folder.mkdir(parents=True)
     blank = folder/'blank.png'
-    height = max(caption_height(script_for(cue['text'], args.language)) for cue in cues) if cues else TOKENS['strip_height']
+    height = max((caption_height(script_for(cue['text'], args.language), args.style) for cue in cues),
+                 default=caption_height(args.language, args.style))
     styling = dict(font_file=args.font, style=args.style, tone=args.tone, language=args.language, height=height)
     caption_image('', **styling).save(blank)
     entries = []

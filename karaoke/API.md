@@ -423,7 +423,7 @@ ASR 固定宽度断行若留下孤立的单字或单词，会在同一短句内�
 | `KARAOKE_REQUIRE_CACHED_SOURCE` | `1` 时只接受同源且哈希完整的媒体缓存，不重新下载媒体 |
 | `KARAOKE_MAX_DURATION_SECONDS` | 默认 `900` |
 | `KARAOKE_COOKIES_FILE` | 可选的 yt-dlp cookies 文件路径；未指定时读取数据目录的 `private/youtube-cookies.txt`。每次下载检查文件，存在则使用，缺失则默认下载；登录失败不会自动退回匿名重试。导出浏览器 cookies 需用户授权，服务本身不读取浏览器；私有目录权限 0700、文件 0600，不提交或上传 |
-| `KARAOKE_FONT_FILE` | 可选的完整字体路径；Linux 可使用覆盖对应语言的 Noto Serif CJK 字体 |
+| `KARAOKE_FONT_FILE` | 可选的字幕字体路径，优先于默认的[源泉圆体](../SETUP.md#字幕字体) |
 | `KARAOKE_DISABLE_LYRIC_CATALOG` | 设为 `1` 时强制走自动歌词，用于测试新歌流程 |
 
 单进程、单 GPU 队列运行；不要给同一数据目录启动多个 Uvicorn worker。`none` 模式下所有已点歌曲可进入流水线，同类阶段按 `KARAOKE_COMPUTE_CONCURRENCY` 限制并发，下载和视频编码仍各为一个槽位，不同阶段可以交错；`/health.preparation_concurrency` 返回 `null`，`running_jobs` 和房间快照的 `preparation_jobs` 列出全部在途任务，旧单数属性保留首项。暂停领取任务后，所有已经开始的歌曲仍会自然完成。并发处理各自监控共享缓存，并按运行任务数预留写入余量。独立的分离环境与主环境都需安装对应硬件的 PyTorch。已验证的硬件与依赖组合见 [SETUP](../SETUP.md#2-完整处理环境)，耗时记录见[性能说明](docs/lead-backing-performance.md)。
